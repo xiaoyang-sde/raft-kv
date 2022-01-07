@@ -1,29 +1,59 @@
 package mr
 
+import "fmt"
 import "log"
 import "net"
 import "os"
+import "sync"
 import "net/rpc"
 import "net/http"
+import "io/ioutil"
 
+type MapTask struct {
+	filename string
+	content  string
+	status   string
+}
 
 type Coordinator struct {
-	// Your definitions here.
-
+	mu      sync.Mutex
+	phase   string
+	nMap    int
+	nReduce int
+	mapTask map[int]*MapTask
 }
 
-// Your code here -- RPC handlers for the worker to call.
+func (c *Coordinator) GetTask(
+	args *GetTaskArgs,
+	reply *GetTaskReply,
+) error {
+	c.mu.Lock()
+	if c.phase == "map" {
+		for id, task := range c.mapTask {
+			if task.status != "idle" {
+				continue
+			}
+			reply.Scheduled = true
+			reply.Phase = c.phase
+			reply.TaskId = id
+			reply.Filename = task.filename
+			reply.Content = task.content
 
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
+			task.status = "scheduled"
+			break
+		}
+		if reply.Scheduled {
+			fmt.Printf(
+				"[%s task scheduled] id: %d - file: %s \n",
+				reply.Phase,
+				reply.TaskId,
+				reply.Filename,
+			)
+		}
+	}
+	c.mu.Unlock()
 	return nil
 }
-
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -50,7 +80,6 @@ func (c *Coordinator) Done() bool {
 
 	// Your code here.
 
-
 	return ret
 }
 
@@ -60,11 +89,32 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
+	c := Coordinator{
+		phase:   "map",
+		nMap:    len(files),
+		nReduce: nReduce,
+		mapTask: make(map[int]*MapTask),
+	}
 
-	// Your code here.
+	for index, filename := range files {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+		}
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read %v", filename)
+		}
+		file.Close()
 
+		c.mapTask[index] = &MapTask{
+			filename: filename,
+			content:  string(content),
+			status:   "idle",
+		}
+	}
 
+	fmt.Printf("The total amount of map tasks: %d\n", len(c.mapTask))
 	c.server()
 	return &c
 }
