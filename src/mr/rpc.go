@@ -3,6 +3,15 @@ package mr
 import "os"
 import "strconv"
 
+type InitWorkerArgs struct {
+
+}
+
+type InitWorkerReply struct {
+	NMap int
+	NReduce int
+}
+
 type GetTaskArgs struct {
 }
 

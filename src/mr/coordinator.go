@@ -23,6 +23,15 @@ type Coordinator struct {
 	mapTask map[int]*MapTask
 }
 
+func (c *Coordinator) InitWorker(
+	args *InitWorkerArgs,
+	reply *InitWorkerReply,
+) error {
+	reply.NMap = c.nMap
+	reply.NReduce = c.nReduce
+	return nil
+}
+
 func (c *Coordinator) GetTask(
 	args *GetTaskArgs,
 	reply *GetTaskReply,

@@ -1,7 +1,10 @@
 package mr
 
+import "os"
 import "fmt"
+import "time"
 import "log"
+import "encoding/json"
 import "net/rpc"
 import "hash/fnv"
 
@@ -24,16 +27,93 @@ func Worker(
 	mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string,
 ) {
-	getTaskArgs := GetTaskArgs{}
-	getTaskReply := GetTaskReply{}
-	call("Coordinator.GetTask", &getTaskArgs, &getTaskReply)
-	if getTaskReply.Scheduled {
-		fmt.Printf(
-			"[%s task received] id: %d - file: %s \n",
-			getTaskReply.Phase,
-			getTaskReply.TaskId,
-			getTaskReply.Filename,
+	initWorkerArgs := InitWorkerArgs{}
+	initWorkerReply := InitWorkerReply{}
+	call(
+		"Coordinator.InitWorker",
+		&initWorkerArgs,
+		&initWorkerReply,
+	)
+	nReduce := initWorkerReply.NReduce
+
+	for {
+		getTaskArgs := GetTaskArgs{}
+		getTaskReply := GetTaskReply{}
+		call(
+			"Coordinator.GetTask",
+			&getTaskArgs,
+			&getTaskReply,
 		)
+
+		if getTaskReply.Scheduled {
+			taskId := getTaskReply.TaskId
+			phase := getTaskReply.Phase
+			filename := getTaskReply.Filename
+			content := getTaskReply.Content
+
+			fmt.Printf(
+				"[%s task received] id: %d, file: %s \n",
+				phase,
+				taskId,
+				filename,
+			)
+
+
+			if phase == "map" {
+				mapResult := mapf(filename, content)
+				fmt.Printf(
+					"[%s task finished] id: %d, kv length: %d\n",
+					phase,
+					taskId,
+					len(mapResult),
+				)
+
+				for _, kv := range mapResult {
+					reduceId := ihash(kv.Key) % nReduce
+					resultFilename := fmt.Sprintf(
+						"mr-%d-%d",
+						taskId,
+						reduceId,
+					)
+					resultFile, openErr := os.OpenFile(
+						resultFilename,
+						os.O_APPEND|os.O_CREATE|os.O_WRONLY,
+						0644,
+					);
+					if openErr != nil {
+						fmt.Printf(
+							"[encode error] id: %d, result file: %s\n",
+							taskId,
+							resultFilename,
+						)
+						break
+					}
+
+					enc := json.NewEncoder(resultFile)
+					encodeErr := enc.Encode(&kv)
+					if encodeErr != nil {
+						fmt.Printf(
+							"[encode error] id: %d, key: %s, value: %s\n",
+							taskId,
+							kv.Key,
+							kv.Value,
+						)
+						break
+					}
+
+					resultFile.Close()
+				}
+
+				fmt.Printf(
+					"[%s task encoded] id: %d\n",
+					phase,
+					taskId,
+				)
+			}
+		} else {
+			time.Sleep(1 * time.Millisecond)
+			break
+		}
 	}
 }
 
