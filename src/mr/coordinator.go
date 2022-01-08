@@ -15,12 +15,17 @@ type MapTask struct {
 	status   string
 }
 
+type ReduceTask struct {
+	status string
+}
+
 type Coordinator struct {
-	mu      sync.Mutex
-	phase   string
-	nMap    int
-	nReduce int
-	mapTask map[int]*MapTask
+	mu         sync.Mutex
+	phase      string
+	nMap       int
+	nReduce    int
+	mapTask    map[int]*MapTask
+	reduceTask map[int]*ReduceTask
 }
 
 func (c *Coordinator) InitWorker(
@@ -37,9 +42,13 @@ func (c *Coordinator) GetTask(
 	reply *GetTaskReply,
 ) error {
 	c.mu.Lock()
+	if len(c.mapTask) == 0 {
+		c.phase = "reduce"
+	}
+
 	if c.phase == "map" {
 		for id, task := range c.mapTask {
-			if task.status != "idle" {
+			if task.status == "scheduled" {
 				continue
 			}
 			reply.Scheduled = true
@@ -51,14 +60,46 @@ func (c *Coordinator) GetTask(
 			task.status = "scheduled"
 			break
 		}
-		if reply.Scheduled {
-			fmt.Printf(
-				"[%s task scheduled] id: %d - file: %s \n",
-				reply.Phase,
-				reply.TaskId,
-				reply.Filename,
-			)
+	}
+
+	if c.phase == "reduce" {
+		for id, task := range c.reduceTask {
+			if task.status == "scheduled" {
+				continue
+			}
+			reply.Scheduled = true
+			reply.Phase = c.phase
+			reply.TaskId = id
+			reply.Filename = fmt.Sprintf("mr-*-%d", id)
+			reply.Content = ""
+
+			task.status = "scheduled"
+			break
 		}
+	}
+
+	if reply.Scheduled {
+		fmt.Printf(
+			"[%s task scheduled] id: %d - file: %s \n",
+			reply.Phase,
+			reply.TaskId,
+			reply.Filename,
+		)
+	}
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Coordinator) UpdateTask(
+	args *UpdateTaskArgs,
+	reply *UpdateTaskReply,
+) error {
+	c.mu.Lock()
+	if args.Phase == "map" {
+		delete(c.mapTask, args.TaskId)
+	}
+	if args.Phase == "reduce" {
+		delete(c.reduceTask, args.TaskId)
 	}
 	c.mu.Unlock()
 	return nil
@@ -85,24 +126,16 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	ret := false
-
-	// Your code here.
-
-	return ret
+	return c.phase == "reduce" && len(c.reduceTask) == 0
 }
 
-//
-// create a Coordinator.
-// main/mrcoordinator.go calls this function.
-// nReduce is the number of reduce tasks to use.
-//
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		phase:   "map",
-		nMap:    len(files),
-		nReduce: nReduce,
-		mapTask: make(map[int]*MapTask),
+		phase:      "map",
+		nMap:       len(files),
+		nReduce:    nReduce,
+		mapTask:    make(map[int]*MapTask),
+		reduceTask: make(map[int]*ReduceTask),
 	}
 
 	for index, filename := range files {
@@ -120,6 +153,12 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 			filename: filename,
 			content:  string(content),
 			status:   "idle",
+		}
+	}
+
+	for index := 0; index < nReduce; index++ {
+		c.reduceTask[index] = &ReduceTask{
+			status: "idle",
 		}
 	}
 
