@@ -1,13 +1,16 @@
 package mr
 
-import "os"
-import "fmt"
-import "time"
-import "log"
-import "sort"
-import "encoding/json"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
 type KeyValue struct {
 	Key   string
@@ -48,159 +51,121 @@ func Worker(
 			&getTaskArgs,
 			&getTaskReply,
 		)
+		if !getTaskReply.Scheduled {
+			time.Sleep(time.Second)
+			continue
+		}
 
-		if getTaskReply.Scheduled {
-			taskId := getTaskReply.TaskId
-			phase := getTaskReply.Phase
-			filename := getTaskReply.Filename
-			content := getTaskReply.Content
+		taskId := getTaskReply.TaskId
+		phase := getTaskReply.Phase
+		filename := getTaskReply.Filename
+		content := getTaskReply.Content
 
-			fmt.Printf(
-				"[%s task received] id: %d, file: %s \n",
-				phase,
-				taskId,
-				filename,
-			)
-
-			if phase == "map" {
-				mapResult := mapf(filename, content)
-				fmt.Printf(
-					"[%s task finished] id: %d, kv length: %d\n",
-					phase,
+		if phase == "map" {
+			mapResult := mapf(filename, content)
+			outputFileList := []*os.File{}
+			for reduceId := 0; reduceId < nReduce; reduceId++ {
+				resultFilename := fmt.Sprintf(
+					"mr-%d-%d",
 					taskId,
-					len(mapResult),
+					reduceId,
 				)
-
-				for reduceId := 0; reduceId < 10; reduceId++ {
-					resultFilename := fmt.Sprintf(
-						"mr-%d-%d",
-						taskId,
-						reduceId,
-					)
-					os.Create(resultFilename)
-				}
-
-				for _, kv := range mapResult {
-					reduceId := ihash(kv.Key) % nReduce
-					resultFilename := fmt.Sprintf(
-						"mr-%d-%d",
-						taskId,
-						reduceId,
-					)
-					resultFile, openErr := os.OpenFile(
-						resultFilename,
-						os.O_APPEND|os.O_CREATE|os.O_WRONLY,
-						0644,
-					)
-					if openErr != nil {
-						fmt.Printf(
-							"[map encode error] id: %d, result file: %s\n",
-							taskId,
-							resultFilename,
-						)
-						return
-					}
-
-					enc := json.NewEncoder(resultFile)
-					encodeErr := enc.Encode(&kv)
-					if encodeErr != nil {
-						fmt.Printf(
-							"[map encode error] id: %d, key: %s, value: %s\n",
-							taskId,
-							kv.Key,
-							kv.Value,
-						)
-						return
-					}
-
-					resultFile.Close()
-				}
-
-				fmt.Printf(
-					"[%s task encoded] id: %d\n",
-					phase,
-					taskId,
-				)
+				tempFile, _ := ioutil.TempFile("", resultFilename)
+				outputFileList = append(outputFileList, tempFile)
 			}
 
-			if phase == "reduce" {
-				reduceInput := []KeyValue{}
-				for mapId := 0; mapId < nMap; mapId++ {
-					inputFilename := fmt.Sprintf(
-						"mr-%d-%d",
-						mapId,
-						taskId,
-					)
+			for _, kv := range mapResult {
+				reduceId := ihash(kv.Key) % nReduce
+				outputFile := outputFileList[reduceId]
 
-					inputFile, openErr := os.Open(inputFilename)
-					if openErr != nil {
-						fmt.Printf(
-							"[reduce decode error] id: %d, input file: %s\n",
-							taskId,
-							inputFilename,
-						)
+				enc := json.NewEncoder(outputFile)
+				encodeErr := enc.Encode(&kv)
+				if encodeErr != nil {
+					return
+				}
+			}
+
+			for reduceId := 0; reduceId < nReduce; reduceId++ {
+				resultFilename := fmt.Sprintf(
+					"mr-%d-%d",
+					taskId,
+					reduceId,
+				)
+				outputFile := outputFileList[reduceId]
+				os.Rename(outputFile.Name(), resultFilename)
+				outputFile.Close()
+			}
+		}
+
+		if phase == "reduce" {
+			reduceInput := []KeyValue{}
+			for mapId := 0; mapId < nMap; mapId++ {
+				inputFilename := fmt.Sprintf(
+					"mr-%d-%d",
+					mapId,
+					taskId,
+				)
+
+				inputFile, openErr := os.Open(inputFilename)
+				if openErr != nil {
+					break
+				}
+
+				dec := json.NewDecoder(inputFile)
+				for {
+					var kv KeyValue
+					if decodeErr := dec.Decode(&kv); decodeErr != nil {
 						break
 					}
-
-					dec := json.NewDecoder(inputFile)
-					for {
-						var kv KeyValue
-						if decodeErr := dec.Decode(&kv); decodeErr != nil {
-							break
-						}
-						reduceInput = append(reduceInput, kv)
-					}
+					reduceInput = append(reduceInput, kv)
 				}
-
-				sort.Sort(ByKey(reduceInput))
-
-				resultFilename := fmt.Sprintf(
-					"mr-out-%d",
-					taskId,
-				)
-				resultFile, _ := os.Create(resultFilename)
-
-				i := 0
-				for i < len(reduceInput) {
-					j := i + 1
-					for j < len(reduceInput) && reduceInput[j].Key == reduceInput[i].Key {
-						j++
-					}
-					values := []string{}
-					for k := i; k < j; k++ {
-						values = append(values, reduceInput[k].Value)
-					}
-					output := reducef(reduceInput[i].Key, values)
-
-					fmt.Fprintf(resultFile, "%v %v\n", reduceInput[i].Key, output)
-
-					i = j
-				}
-
-				resultFile.Close()
 			}
 
-			updateTaskArgs := UpdateTaskArgs{
-				Phase:  phase,
-				TaskId: taskId,
-			}
-			updateTaskReply := UpdateTaskReply{}
-			call(
-				"Coordinator.UpdateTask",
-				&updateTaskArgs,
-				&updateTaskReply,
+			sort.Sort(ByKey(reduceInput))
+
+			outputFileName := fmt.Sprintf(
+				"mr-out-%d",
+				taskId,
 			)
-		} else {
-			time.Sleep(1 * time.Millisecond)
+			outputFile, _ := ioutil.TempFile("", outputFileName)
+
+			i := 0
+			for i < len(reduceInput) {
+				j := i + 1
+				for j < len(reduceInput) && reduceInput[j].Key == reduceInput[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, reduceInput[k].Value)
+				}
+				output := reducef(reduceInput[i].Key, values)
+
+				fmt.Fprintf(outputFile, "%v %v\n", reduceInput[i].Key, output)
+
+				i = j
+			}
+
+			os.Rename(outputFile.Name(), outputFileName)
+			outputFile.Close()
+		}
+
+		CommitTaskArgs := CommitTaskArgs{
+			Phase:  phase,
+			TaskId: taskId,
+		}
+		CommitTaskReply := CommitTaskReply{}
+		call(
+			"Coordinator.CommitTask",
+			&CommitTaskArgs,
+			&CommitTaskReply,
+		)
+		if CommitTaskReply.Done {
+			return
 		}
 	}
 }
 
-//
-// send an RPC request to the coordinator, wait for the response.
-// usually returns true.
-// returns false if something goes wrong.
-//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()

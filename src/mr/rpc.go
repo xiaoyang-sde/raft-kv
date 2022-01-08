@@ -1,7 +1,9 @@
 package mr
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 type InitWorkerArgs struct {
 }
@@ -22,12 +24,13 @@ type GetTaskReply struct {
 	Content   string
 }
 
-type UpdateTaskArgs struct {
+type CommitTaskArgs struct {
 	Phase  string
 	TaskId int
 }
 
-type UpdateTaskReply struct {
+type CommitTaskReply struct {
+	Done bool
 }
 
 func coordinatorSock() string {

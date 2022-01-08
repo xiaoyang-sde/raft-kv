@@ -1,22 +1,22 @@
 package mr
 
-import "fmt"
-import "log"
-import "net"
-import "os"
-import "sync"
-import "net/rpc"
-import "net/http"
-import "io/ioutil"
+import (
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+	"time"
+)
 
-type MapTask struct {
-	filename string
-	content  string
-	status   string
-}
-
-type ReduceTask struct {
-	status string
+type Task struct {
+	filename  string
+	content   string
+	status    string
+	timestamp time.Time
 }
 
 type Coordinator struct {
@@ -24,8 +24,8 @@ type Coordinator struct {
 	phase      string
 	nMap       int
 	nReduce    int
-	mapTask    map[int]*MapTask
-	reduceTask map[int]*ReduceTask
+	mapTask    map[int]*Task
+	reduceTask map[int]*Task
 }
 
 func (c *Coordinator) InitWorker(
@@ -37,11 +37,38 @@ func (c *Coordinator) InitWorker(
 	return nil
 }
 
+func (c *Coordinator) heartbeat() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, task := range c.mapTask {
+		if task.status == "idle" {
+			continue
+		}
+		diff := time.Since(task.timestamp)
+		if diff.Seconds() > 10 {
+			task.status = "idle"
+		}
+	}
+
+	for _, task := range c.reduceTask {
+		if task.status == "idle" {
+			continue
+		}
+		diff := time.Since(task.timestamp)
+		if diff.Seconds() > 10 {
+			task.status = "idle"
+		}
+	}
+}
+
 func (c *Coordinator) GetTask(
 	args *GetTaskArgs,
 	reply *GetTaskReply,
 ) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if len(c.mapTask) == 0 {
 		c.phase = "reduce"
 	}
@@ -58,6 +85,7 @@ func (c *Coordinator) GetTask(
 			reply.Content = task.content
 
 			task.status = "scheduled"
+			task.timestamp = time.Now()
 			break
 		}
 	}
@@ -74,44 +102,37 @@ func (c *Coordinator) GetTask(
 			reply.Content = ""
 
 			task.status = "scheduled"
+			task.timestamp = time.Now()
 			break
 		}
 	}
-
-	if reply.Scheduled {
-		fmt.Printf(
-			"[%s task scheduled] id: %d - file: %s \n",
-			reply.Phase,
-			reply.TaskId,
-			reply.Filename,
-		)
-	}
-	c.mu.Unlock()
 	return nil
 }
 
-func (c *Coordinator) UpdateTask(
-	args *UpdateTaskArgs,
-	reply *UpdateTaskReply,
+func (c *Coordinator) CommitTask(
+	args *CommitTaskArgs,
+	reply *CommitTaskReply,
 ) error {
 	c.mu.Lock()
-	if args.Phase == "map" {
-		delete(c.mapTask, args.TaskId)
+	defer c.mu.Unlock()
+
+	phase := args.Phase
+	taskId := args.TaskId
+	if phase == "map" && c.mapTask[taskId].status == "scheduled" {
+		delete(c.mapTask, taskId)
 	}
-	if args.Phase == "reduce" {
-		delete(c.reduceTask, args.TaskId)
+
+	if phase == "reduce" && c.reduceTask[taskId].status == "scheduled" {
+		delete(c.reduceTask, taskId)
 	}
-	c.mu.Unlock()
+
+	reply.Done = c.phase == "reduce" && len(c.reduceTask) == 0
 	return nil
 }
 
-//
-// start a thread that listens for RPCs from worker.go
-//
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
 	sockname := coordinatorSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
@@ -121,11 +142,9 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
-//
-// main/mrcoordinator.go calls Done() periodically to find out
-// if the entire job has finished.
-//
 func (c *Coordinator) Done() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.phase == "reduce" && len(c.reduceTask) == 0
 }
 
@@ -134,8 +153,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		phase:      "map",
 		nMap:       len(files),
 		nReduce:    nReduce,
-		mapTask:    make(map[int]*MapTask),
-		reduceTask: make(map[int]*ReduceTask),
+		mapTask:    make(map[int]*Task),
+		reduceTask: make(map[int]*Task),
 	}
 
 	for index, filename := range files {
@@ -149,7 +168,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		}
 		file.Close()
 
-		c.mapTask[index] = &MapTask{
+		c.mapTask[index] = &Task{
 			filename: filename,
 			content:  string(content),
 			status:   "idle",
@@ -157,12 +176,18 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 
 	for index := 0; index < nReduce; index++ {
-		c.reduceTask[index] = &ReduceTask{
+		c.reduceTask[index] = &Task{
 			status: "idle",
 		}
 	}
 
-	fmt.Printf("The total amount of map tasks: %d\n", len(c.mapTask))
+	go func() {
+		for {
+			c.heartbeat()
+			time.Sleep(time.Second)
+		}
+	}()
+
 	c.server()
 	return &c
 }
