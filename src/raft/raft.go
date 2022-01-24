@@ -29,6 +29,13 @@ import (
 	"6.824/labrpc"
 )
 
+const (
+	Follower           = 1
+	Candidate          = 2
+	Leader             = 3
+	HEART_BEAT_TIMEOUT = 100
+)
+
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -62,13 +69,12 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	log             []LogEntry    // log entries
-	state           string        // the state of the current instance
-	currentTerm     int           // latest term server has seen
-	votedFor        int           // candidateId that received vote in current term
-	voteCount       int           // the number of votes received in the current term
-	lastHeartbeat   time.Time     // the timestamp of the last heartbeat message
-	electionTimeout time.Duration // the duration of the election timeout
+	log           []LogEntry // log entries
+	state         int        // the state of the current instance
+	currentTerm   int        // latest term server has seen
+	votedFor      int        // candidateId that received vote in current term
+	voteCount     int        // the number of votes received in the current term
+	lastHeartbeat time.Time  // the timestamp of the last heartbeat message
 }
 
 type LogEntry struct{}
@@ -78,7 +84,7 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.mu.Unlock()
 
 	term := rf.currentTerm
-	isLeader := rf.state == "leader"
+	isLeader := rf.state == Leader
 	return term, isLeader
 }
 
@@ -172,19 +178,25 @@ func (rf *Raft) RequestVote(
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.lastHeartbeat = time.Now()
-
 	candidateId := args.CandidateId
 	candidateTerm := args.Term
 
+	if candidateTerm < rf.currentTerm {
+		rf.debug(
+			fmt.Sprintf("-- Stale Vote -> %d", rf.votedFor),
+			"warning",
+		)
+		reply.Term = rf.currentTerm
+		return
+	}
+
 	if candidateTerm > rf.currentTerm {
-		rf.state = "follower"
+		rf.state = Follower
 		rf.votedFor = -1
-		rf.voteCount = 0
 		rf.currentTerm = candidateTerm
 	}
 
-	if candidateTerm == rf.currentTerm && (rf.votedFor == -1 || rf.votedFor == candidateId) {
+	if rf.votedFor == -1 || rf.votedFor == candidateId {
 		rf.votedFor = candidateId
 		reply.VoteGranted = true
 		rf.debug(
@@ -193,7 +205,7 @@ func (rf *Raft) RequestVote(
 		)
 	} else {
 		rf.debug(
-			fmt.Sprintf("-- Refuse Vote -> %d", rf.votedFor),
+			fmt.Sprintf("-- Duplicate Vote -> %d", rf.votedFor),
 			"warning",
 		)
 	}
@@ -215,14 +227,14 @@ func (rf *Raft) AppendEntries(
 		return
 	}
 
-	rf.state = "follower"
-	rf.lastHeartbeat = time.Now()
-	rf.votedFor = -1
-	rf.voteCount = 0
-	rf.currentTerm = leaderTerm
+	if leaderTerm > rf.currentTerm {
+		rf.currentTerm = leaderTerm
+		rf.state = Follower
+		rf.votedFor = -1
+	}
 
+	rf.lastHeartbeat = time.Now()
 	reply.Success = true
-	reply.Term = rf.currentTerm
 
 	rf.debug(
 		fmt.Sprintf("<- Heartbeat -- %d", leaderId),
@@ -253,7 +265,7 @@ func (rf *Raft) sendRequestVote(
 	rf.mu.Lock()
 
 	voteGranted := requestVoteReply.VoteGranted
-	if rf.state == "candidate" && voteGranted {
+	if rf.state == Candidate && voteGranted {
 		rf.voteCount += 1
 		rf.debug(
 			fmt.Sprintf("<- Vote -- %d", server),
@@ -261,9 +273,9 @@ func (rf *Raft) sendRequestVote(
 		)
 	}
 
-	if rf.state == "candidate" && rf.voteCount == len(rf.peers)/2+1 {
+	if rf.state == Candidate && rf.voteCount == len(rf.peers)/2+1 {
 		rf.debug("-- Leader --", "success")
-		rf.state = "leader"
+		rf.state = Leader
 		rf.mu.Unlock()
 
 		for server := range rf.peers {
@@ -279,18 +291,23 @@ func (rf *Raft) sendRequestVote(
 
 func (rf *Raft) electionRoutine() {
 	for !rf.killed() {
-		time.Sleep(time.Duration(rand.Intn(100)+50) * time.Millisecond)
+		electionTimeout := time.Duration(
+			HEART_BEAT_TIMEOUT*2+rand.Intn(HEART_BEAT_TIMEOUT),
+		) * time.Millisecond
 
 		rf.mu.Lock()
-		if rf.state != "leader" && time.Since(rf.lastHeartbeat) >= rf.electionTimeout {
-			rf.state = "candidate"
+		if rf.state == Follower && time.Since(rf.lastHeartbeat) >= electionTimeout {
+			rf.state = Candidate
+		}
+
+		if rf.state == Candidate {
 			rf.currentTerm += 1
 			rf.voteCount = 1
 			rf.votedFor = rf.me
 			rf.debug(
 				fmt.Sprintf(
 					"-- Election (Timeout: %d ms, Since Last: %d ms) --",
-					rf.electionTimeout.Milliseconds(),
+					electionTimeout.Milliseconds(),
 					time.Since(rf.lastHeartbeat).Milliseconds(),
 				),
 				"success",
@@ -306,6 +323,8 @@ func (rf *Raft) electionRoutine() {
 		} else {
 			rf.mu.Unlock()
 		}
+
+		time.Sleep(electionTimeout)
 	}
 }
 
@@ -336,7 +355,7 @@ func (rf *Raft) sendHeartbeat(
 func (rf *Raft) heartbeatRoutine() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.state == "leader" {
+		if rf.state == Leader {
 			rf.mu.Unlock()
 			for server := range rf.peers {
 				if server == rf.me {
@@ -347,7 +366,7 @@ func (rf *Raft) heartbeatRoutine() {
 		} else {
 			rf.mu.Unlock()
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(HEART_BEAT_TIMEOUT * time.Millisecond)
 	}
 }
 
@@ -389,9 +408,9 @@ func (rf *Raft) sendRequestVoteRPC(
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	if reply.Term > rf.currentTerm {
-		rf.state = "follower"
-		rf.voteCount = 0
+		rf.state = Follower
 		rf.votedFor = -1
 		rf.currentTerm = reply.Term
 	}
@@ -407,9 +426,9 @@ func (rf *Raft) sendAppendEntriesRPC(
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	if reply.Term > rf.currentTerm {
-		rf.state = "follower"
-		rf.voteCount = 0
+		rf.state = Follower
 		rf.votedFor = -1
 		rf.currentTerm = reply.Term
 	}
@@ -506,11 +525,10 @@ func Make(
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.log = make([]LogEntry, 0)
-	rf.state = "follower"
+	rf.state = Follower
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.lastHeartbeat = time.Now()
-	rf.electionTimeout = time.Duration(rand.Intn(400)+400) * time.Millisecond
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
