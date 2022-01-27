@@ -328,6 +328,7 @@ func (rf *Raft) sendRequestVote(
 ) {
 	rf.mu.Lock()
 	if rf.state != Candidate {
+		rf.mu.Unlock()
 		return
 	}
 
@@ -351,6 +352,10 @@ func (rf *Raft) sendRequestVote(
 	)
 
 	rf.mu.Lock()
+	if rf.state != Candidate {
+		rf.mu.Unlock()
+		return
+	}
 
 	term := requestVoteReply.Term
 	voteGranted := requestVoteReply.VoteGranted
@@ -360,7 +365,7 @@ func (rf *Raft) sendRequestVote(
 		rf.currentTerm = term
 	}
 
-	if rf.state == Candidate && voteGranted {
+	if voteGranted {
 		rf.voteCount += 1
 		rf.debug(
 			fmt.Sprintf("<- Vote -- %d", server),
@@ -368,7 +373,7 @@ func (rf *Raft) sendRequestVote(
 		)
 	}
 
-	if rf.state == Candidate && rf.voteCount == len(rf.peers)/2+1 {
+	if rf.voteCount == len(rf.peers)/2+1 {
 		rf.debug("-- Leader --", "success")
 		rf.state = Leader
 		for i := 0; i < len(rf.peers); i++ {
@@ -392,6 +397,11 @@ func (rf *Raft) sendAppendEntries(
 	server int,
 ) {
 	rf.mu.Lock()
+	if rf.state != Leader {
+		rf.mu.Unlock()
+		return
+	}
+
 	startIndex := rf.nextIndex[server]
 	prevLogIndex := startIndex - 1
 	prevLogTerm := rf.log[prevLogIndex].Term
@@ -430,8 +440,8 @@ func (rf *Raft) sendAppendEntries(
 	}
 
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if rf.state != Leader {
+		rf.mu.Unlock()
 		return
 	}
 
@@ -466,6 +476,7 @@ func (rf *Raft) sendAppendEntries(
 	} else if rf.nextIndex[server] > 1 {
 		rf.nextIndex[server] -= 1
 	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) electionRoutine() {
@@ -575,13 +586,6 @@ func (rf *Raft) sendRequestVoteRPC(
 	args *RequestVoteArgs,
 	reply *RequestVoteReply,
 ) bool {
-	rf.mu.Lock()
-	if rf.state != Candidate {
-		rf.mu.Unlock()
-		return false
-	}
-	rf.mu.Unlock()
-
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -591,13 +595,6 @@ func (rf *Raft) sendAppendEntriesRPC(
 	args *AppendEntriesArgs,
 	reply *AppendEntriesReply,
 ) bool {
-	rf.mu.Lock()
-	if rf.state != Leader {
-		rf.mu.Unlock()
-		return false
-	}
-	rf.mu.Unlock()
-
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -723,7 +720,7 @@ func Make(
 	rf.log = make([]LogEntry, 0)
 	rf.log = append(rf.log, LogEntry{
 		Command: -1,
-		Term: -1,
+		Term:    -1,
 	})
 
 	rf.state = Follower
