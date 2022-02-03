@@ -18,15 +18,14 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"6.824/labgob"
+	"6.824/labrpc"
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	//	"6.824/labgob"
-	"6.824/labrpc"
 )
 
 const (
@@ -66,9 +65,6 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
 	state         int       // the state of the current instance
 	currentTerm   int       // latest term server has seen
 	votedFor      int       // candidateId that received vote in current term
@@ -101,36 +97,47 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	writer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(writer)
+	encoder.Encode(rf.currentTerm)
+	encoder.Encode(rf.votedFor)
+	encoder.Encode(rf.log)
+	data := writer.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if data == nil || len(data) < 1 {
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	reader := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(reader)
+
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+
+	if decoder.Decode(&currentTerm) == nil {
+		rf.currentTerm = currentTerm
+	} else {
+		return
+	}
+
+	if decoder.Decode(&votedFor) == nil {
+		rf.votedFor = votedFor
+	} else {
+		return
+	}
+
+	if decoder.Decode(&log) == nil {
+		rf.log = log
+	} else {
+		return
+	}
 }
 
 //
@@ -175,11 +182,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Success bool
-	Term    int
-	XTerm   int // term in the conflicting entry
-	XIndex  int // index of first entry with that term
-	XLength int // log length
+	Success       bool
+	Term          int
+	ConflictTerm  int // term in the conflicting entry
+	ConflictIndex int // index of first entry with that term
 }
 
 func (rf *Raft) RequestVote(
@@ -188,6 +194,7 @@ func (rf *Raft) RequestVote(
 ) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	candidateId := args.CandidateId
 	candidateTerm := args.Term
@@ -264,13 +271,14 @@ func (rf *Raft) AppendEntries(
 ) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	leaderTerm := args.Term
 	leaderId := args.LeaderId
 
 	if leaderTerm < rf.currentTerm {
-		reply.Term = rf.currentTerm
 		reply.Success = false
+		reply.Term = rf.currentTerm
 		return
 	}
 
@@ -287,26 +295,34 @@ func (rf *Raft) AppendEntries(
 	prevLogTerm := args.PrevLogTerm
 
 	if prevLogIndex >= len(rf.log) {
-		reply.Term = rf.currentTerm
 		reply.Success = false
-		reply.XLength = len(rf.log)
-		reply.XTerm = -1
-		reply.XIndex = -1
+		reply.Term = rf.currentTerm
+
+		reply.ConflictTerm = -1
+		reply.ConflictIndex = len(rf.log)
+		rf.debug(
+			fmt.Sprintf("Follower Conflict: %d %d", reply.ConflictTerm, reply.ConflictIndex),
+			"success",
+		)
 		return
 	}
 
 	if rf.log[prevLogIndex].Term != prevLogTerm {
-		reply.Term = rf.currentTerm
 		reply.Success = false
-		reply.XLength = len(rf.log)
+		reply.Term = rf.currentTerm
 
-		reply.XTerm = rf.log[prevLogIndex].Term
-		for i := prevLogIndex; i >= 0; i -= 1 {
-			if rf.log[i].Term != reply.XTerm {
+		reply.ConflictTerm = rf.log[prevLogIndex].Term
+		for i := prevLogIndex; i > 0; i -= 1 {
+			if rf.log[i - 1].Term != reply.ConflictTerm {
+				reply.ConflictIndex = i
 				break
 			}
-			reply.XIndex = i
 		}
+
+		rf.debug(
+			fmt.Sprintf("Follower Conflict: %d %d", reply.ConflictTerm, reply.ConflictIndex),
+			"success",
+		)
 		return
 	}
 
@@ -382,6 +398,7 @@ func (rf *Raft) sendRequestVote(
 		rf.state = Follower
 		rf.votedFor = -1
 		rf.currentTerm = term
+		rf.persist()
 	}
 
 	if voteGranted {
@@ -459,13 +476,23 @@ func (rf *Raft) sendAppendEntries(
 	}
 
 	rf.mu.Lock()
+
+	success := appendEntriesReply.Success
+	term := appendEntriesReply.Term
+	conflictTerm := appendEntriesReply.ConflictTerm
+	conflictIndex := appendEntriesReply.ConflictIndex
+
+	if term > rf.currentTerm {
+		rf.state = Follower
+		rf.votedFor = -1
+		rf.currentTerm = term
+		rf.persist()
+	}
+
 	if rf.state != Leader {
 		rf.mu.Unlock()
 		return
 	}
-
-	success := appendEntriesReply.Success
-	term := appendEntriesReply.Term
 
 	if success {
 		rf.matchIndex[server] = prevLogIndex + len(entries)
@@ -488,26 +515,21 @@ func (rf *Raft) sendAppendEntries(
 			}
 		}
 		rf.apply()
-	} else if term > rf.currentTerm {
-		rf.state = Follower
-		rf.votedFor = -1
-		rf.currentTerm = term
-	} else if rf.nextIndex[server] > 1 {
-		xLength := appendEntriesReply.XLength
-		xTerm := appendEntriesReply.XTerm
-		xIndex := appendEntriesReply.XIndex
-
-		if xTerm == -1 {
-			rf.nextIndex[server] = xLength
-		} else {
-			rf.nextIndex[server] = xIndex
-			for index, entry := range rf.log {
-				if entry.Term == xTerm {
-					rf.nextIndex[server] = index
+	} else if conflictIndex > 0 {
+		rf.nextIndex[server] = conflictIndex
+		if conflictTerm > 0 {
+			for i := len(rf.log) - 1; i >= 1; i -= 1 {
+				if rf.log[i].Term == conflictTerm {
+					rf.nextIndex[server] = i + 1
 					break
 				}
 			}
 		}
+
+		rf.debug(
+			fmt.Sprintf("Conflict: %d %d %d", conflictTerm, conflictIndex, rf.nextIndex[server]),
+			"success",
+		)
 	}
 
 	rf.mu.Unlock()
@@ -528,6 +550,7 @@ func (rf *Raft) electionRoutine() {
 			rf.currentTerm += 1
 			rf.voteCount = 1
 			rf.votedFor = rf.me
+			rf.persist()
 			rf.debug(
 				fmt.Sprintf(
 					"-- Election (Timeout: %d ms, Since Last: %d ms) --",
@@ -536,8 +559,8 @@ func (rf *Raft) electionRoutine() {
 				),
 				"success",
 			)
-
 			rf.mu.Unlock()
+
 			for server := range rf.peers {
 				if server == rf.me {
 					continue
@@ -662,6 +685,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		})
 		rf.matchIndex[rf.me] = index
 		rf.nextIndex[rf.me] = index + 1
+		rf.persist()
+
 		rf.debug(
 			fmt.Sprintf("-- Command %d in term %d --", command, term),
 			"success",
@@ -704,7 +729,7 @@ func (rf *Raft) debug(
 	message string,
 	level string,
 ) {
-	debug := false
+	debug := true
 	if !debug {
 		return
 	}
