@@ -344,7 +344,6 @@ func (rf *Raft) AppendEntries(
 		} else {
 			rf.commitIndex = len(rf.log) - 1
 		}
-		rf.apply()
 		rf.debug(fmt.Sprintf("-- Commit %d --", rf.commitIndex), "success")
 	}
 
@@ -527,7 +526,6 @@ func (rf *Raft) sendAppendEntries(
 				break
 			}
 		}
-		rf.apply()
 	} else if conflictIndex > 0 {
 		rf.nextIndex[server] = conflictIndex
 		if conflictTerm > 0 {
@@ -551,21 +549,13 @@ func (rf *Raft) sendAppendEntries(
 func (rf *Raft) electionRoutine() {
 	for !rf.killed() {
 		electionTimeout := time.Duration(
-			HEART_BEAT_TIMEOUT*2.5+rand.Intn(HEART_BEAT_TIMEOUT),
+			HEART_BEAT_TIMEOUT*2+rand.Intn(HEART_BEAT_TIMEOUT),
 		) * time.Millisecond
 
 		rf.mu.Lock()
-		if rf.state == Follower && time.Since(rf.lastHeartbeat) >= electionTimeout {
+
+		if rf.state != Leader && time.Since(rf.lastHeartbeat) >= electionTimeout {
 			rf.state = Candidate
-		}
-
-		if rf.state == Candidate {
-			rf.currentTerm += 1
-			rf.voteCount = 1
-			rf.votedFor = rf.me
-			rf.lastHeartbeat = time.Now()
-			rf.persist()
-
 			rf.debug(
 				fmt.Sprintf(
 					"-- Election (Timeout: %d ms, Since Last: %d ms) --",
@@ -574,6 +564,13 @@ func (rf *Raft) electionRoutine() {
 				),
 				"success",
 			)
+
+			rf.currentTerm += 1
+			rf.voteCount = 1
+			rf.votedFor = rf.me
+			rf.lastHeartbeat = time.Now()
+			rf.persist()
+
 			rf.mu.Unlock()
 
 			for server := range rf.peers {
@@ -586,23 +583,31 @@ func (rf *Raft) electionRoutine() {
 			rf.mu.Unlock()
 		}
 
-		time.Sleep(electionTimeout)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-func (rf *Raft) apply() {
-	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		rf.lastApplied = i
-		rf.debug(
-			fmt.Sprintf("-- Apply %d of %v --", i, rf.log),
-			"success",
-		)
-		applyMsg := ApplyMsg{
-			CommandValid: true,
-			Command:      rf.log[i].Command,
-			CommandIndex: i,
+func (rf *Raft) applyRoutine() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			rf.lastApplied = i
+			rf.debug(
+				fmt.Sprintf("-- Apply %d of %v --", i, rf.log),
+				"success",
+			)
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[i].Command,
+				CommandIndex: i,
+			}
+			rf.mu.Unlock()
+			rf.applyCh <- applyMsg
+			rf.mu.Lock()
 		}
-		rf.applyCh <- applyMsg
+		rf.mu.Unlock()
+
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -744,7 +749,7 @@ func (rf *Raft) debug(
 	message string,
 	level string,
 ) {
-	debug := true
+	debug := false
 	if !debug {
 		return
 	}
@@ -813,5 +818,6 @@ func Make(
 
 	go rf.electionRoutine()
 	go rf.replicationRoutine()
+	go rf.applyRoutine()
 	return rf
 }
