@@ -18,14 +18,15 @@ package raft
 //
 
 import (
-	"6.824/labgob"
-	"6.824/labrpc"
 	"bytes"
 	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"6.824/labgob"
+	"6.824/labrpc"
 )
 
 const (
@@ -313,7 +314,7 @@ func (rf *Raft) AppendEntries(
 
 		reply.ConflictTerm = rf.log[prevLogIndex].Term
 		for i := prevLogIndex; i > 0; i -= 1 {
-			if rf.log[i - 1].Term != reply.ConflictTerm {
+			if rf.log[i-1].Term != reply.ConflictTerm {
 				reply.ConflictIndex = i
 				break
 			}
@@ -326,7 +327,15 @@ func (rf *Raft) AppendEntries(
 		return
 	}
 
-	rf.log = append(rf.log[:prevLogIndex+1], leaderLogEntries...)
+	for i := 0; i < len(leaderLogEntries); i++ {
+		logIndex := prevLogIndex + i + 1
+		if logIndex < len(rf.log) && rf.log[logIndex].Term != leaderLogEntries[i].Term {
+			rf.log = rf.log[:logIndex]
+		}
+		if logIndex >= len(rf.log) {
+			rf.log = append(rf.log, leaderLogEntries[i])
+		}
+	}
 
 	leaderCommit := args.LeaderCommit
 	if rf.commitIndex < leaderCommit {
@@ -340,6 +349,8 @@ func (rf *Raft) AppendEntries(
 	}
 
 	reply.Success = true
+	reply.Term = rf.currentTerm
+
 	if len(leaderLogEntries) == 0 {
 		rf.debug(
 			fmt.Sprintf("<- Heartbeat -- %d", leaderId),
@@ -387,18 +398,20 @@ func (rf *Raft) sendRequestVote(
 	)
 
 	rf.mu.Lock()
-	if rf.state != Candidate {
-		rf.mu.Unlock()
-		return
-	}
 
 	term := requestVoteReply.Term
 	voteGranted := requestVoteReply.VoteGranted
+
 	if term > rf.currentTerm {
 		rf.state = Follower
 		rf.votedFor = -1
 		rf.currentTerm = term
 		rf.persist()
+	}
+
+	if rf.state != Candidate || term != rf.currentTerm {
+		rf.mu.Unlock()
+		return
 	}
 
 	if voteGranted {
@@ -448,10 +461,10 @@ func (rf *Raft) sendAppendEntries(
 	appendEntriesArgs := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
+		LeaderCommit: rf.commitIndex,
 		Entries:      entries,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
-		LeaderCommit: rf.commitIndex,
 	}
 	appendEntriesReply := AppendEntriesReply{}
 
@@ -489,7 +502,7 @@ func (rf *Raft) sendAppendEntries(
 		rf.persist()
 	}
 
-	if rf.state != Leader {
+	if rf.state != Leader || term != rf.currentTerm {
 		rf.mu.Unlock()
 		return
 	}
@@ -538,7 +551,7 @@ func (rf *Raft) sendAppendEntries(
 func (rf *Raft) electionRoutine() {
 	for !rf.killed() {
 		electionTimeout := time.Duration(
-			HEART_BEAT_TIMEOUT*2+rand.Intn(HEART_BEAT_TIMEOUT),
+			HEART_BEAT_TIMEOUT*2.5+rand.Intn(HEART_BEAT_TIMEOUT),
 		) * time.Millisecond
 
 		rf.mu.Lock()
@@ -550,7 +563,9 @@ func (rf *Raft) electionRoutine() {
 			rf.currentTerm += 1
 			rf.voteCount = 1
 			rf.votedFor = rf.me
+			rf.lastHeartbeat = time.Now()
 			rf.persist()
+
 			rf.debug(
 				fmt.Sprintf(
 					"-- Election (Timeout: %d ms, Since Last: %d ms) --",
