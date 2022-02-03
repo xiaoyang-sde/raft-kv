@@ -177,6 +177,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Success bool
 	Term    int
+	XTerm   int // term in the conflicting entry
+	XIndex  int // index of first entry with that term
+	XLength int // log length
 }
 
 func (rf *Raft) RequestVote(
@@ -283,15 +286,31 @@ func (rf *Raft) AppendEntries(
 	prevLogIndex := args.PrevLogIndex
 	prevLogTerm := args.PrevLogTerm
 
-	if prevLogIndex >= len(rf.log) || rf.log[prevLogIndex].Term != prevLogTerm {
+	if prevLogIndex >= len(rf.log) {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		reply.XLength = len(rf.log)
+		reply.XTerm = -1
+		reply.XIndex = -1
 		return
 	}
 
-	logClone := make([]LogEntry, len(rf.log))
-	copy(logClone, rf.log)
-	rf.log = append(logClone[:prevLogIndex+1], leaderLogEntries...)
+	if rf.log[prevLogIndex].Term != prevLogTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		reply.XLength = len(rf.log)
+
+		reply.XTerm = rf.log[prevLogIndex].Term
+		for i := prevLogIndex; i >= 0; i -= 1 {
+			if rf.log[i].Term != reply.XTerm {
+				break
+			}
+			reply.XIndex = i
+		}
+		return
+	}
+
+	rf.log = append(rf.log[:prevLogIndex+1], leaderLogEntries...)
 
 	leaderCommit := args.LeaderCommit
 	if rf.commitIndex < leaderCommit {
@@ -474,8 +493,23 @@ func (rf *Raft) sendAppendEntries(
 		rf.votedFor = -1
 		rf.currentTerm = term
 	} else if rf.nextIndex[server] > 1 {
-		rf.nextIndex[server] -= 1
+		xLength := appendEntriesReply.XLength
+		xTerm := appendEntriesReply.XTerm
+		xIndex := appendEntriesReply.XIndex
+
+		if xTerm == -1 {
+			rf.nextIndex[server] = xLength
+		} else {
+			rf.nextIndex[server] = xIndex
+			for index, entry := range rf.log {
+				if entry.Term == xTerm {
+					rf.nextIndex[server] = index
+					break
+				}
+			}
+		}
 	}
+
 	rf.mu.Unlock()
 }
 
@@ -670,7 +704,7 @@ func (rf *Raft) debug(
 	message string,
 	level string,
 ) {
-	debug := true
+	debug := false
 	if !debug {
 		return
 	}
