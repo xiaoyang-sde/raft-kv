@@ -30,9 +30,9 @@ import (
 )
 
 const (
-	Follower           = 1
-	Candidate          = 2
-	Leader             = 3
+	Follower           = 0
+	Candidate          = 1
+	Leader             = 2
 	HEART_BEAT_TIMEOUT = 100
 )
 
@@ -78,11 +78,43 @@ type Raft struct {
 	nextIndex   []int         // inidex of the next log entry to send to each server
 	matchIndex  []int         // index of highest log entry known to be replicated on each server
 	applyCh     chan ApplyMsg // the channel to send ApplyMsg
+
+	lastIncludedTerm  int
+	lastIncludedIndex int
 }
 
 type LogEntry struct {
 	Command interface{}
 	Term    int
+	Index   int
+}
+
+type RequestVoteArgs struct {
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type RequestVoteReply struct {
+	Term        int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	LeaderCommit int
+	Entries      []LogEntry
+}
+
+type AppendEntriesReply struct {
+	Success       bool
+	Term          int
+	ConflictTerm  int // term in the conflicting entry
+	ConflictIndex int // index of first entry with that term
 }
 
 func (rf *Raft) GetState() (int, bool) {
@@ -90,6 +122,30 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.mu.Unlock()
 
 	return rf.currentTerm, rf.state == Leader
+}
+
+func (rf *Raft) GetIndex(
+	index int,
+) int {
+	return index - rf.lastIncludedIndex - 1
+}
+
+func (rf *Raft) GetLogEntry(
+	index int,
+) LogEntry {
+	if index < 0 {
+		index += rf.lastIncludedIndex + len(rf.log) + 1
+	}
+	if index < rf.lastIncludedIndex {
+		panic(fmt.Sprintf("Index %d before last included", index))
+	}
+	if index == rf.lastIncludedIndex {
+		return LogEntry{
+			Index: rf.lastIncludedIndex,
+			Term:  rf.lastIncludedTerm,
+		}
+	}
+	return rf.log[rf.GetIndex(index)]
 }
 
 //
@@ -142,11 +198,14 @@ func (rf *Raft) readPersist(data []byte) {
 }
 
 //
-// A service wants to switch to snapshot.  Only do so if Raft hasn't
+// A service wants to switch to snapshot. Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 //
-func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
+func (rf *Raft) CondInstallSnapshot(
+	lastIncludedTerm int,
+	lastIncludedIndex int,
+	snapshot []byte,
+) bool {
 	// Your code here (2D).
 
 	return true
@@ -156,37 +215,12 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
+func (rf *Raft) Snapshot(
+	index int,
+	snapshot []byte,
+) {
 	// Your code here (2D).
 
-}
-
-type RequestVoteArgs struct {
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-type RequestVoteReply struct {
-	Term        int
-	VoteGranted bool
-}
-
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderId     int
-	PrevLogIndex int
-	PrevLogTerm  int
-	LeaderCommit int
-	Entries      []LogEntry
-}
-
-type AppendEntriesReply struct {
-	Success       bool
-	Term          int
-	ConflictTerm  int // term in the conflicting entry
-	ConflictIndex int // index of first entry with that term
 }
 
 func (rf *Raft) RequestVote(
@@ -223,8 +257,8 @@ func (rf *Raft) RequestVote(
 
 	candidateLastLogIndex := args.LastLogIndex
 	candidateLastLogTerm := args.LastLogTerm
-	localLastLogIndex := len(rf.log) - 1
-	localLastLogTerm := rf.log[localLastLogIndex].Term
+	localLastLogIndex := rf.GetLogEntry(-1).Index
+	localLastLogTerm := rf.GetLogEntry(-1).Term
 
 	if candidateLastLogTerm < localLastLogTerm {
 		rf.debug(
@@ -295,12 +329,12 @@ func (rf *Raft) AppendEntries(
 	prevLogIndex := args.PrevLogIndex
 	prevLogTerm := args.PrevLogTerm
 
-	if prevLogIndex >= len(rf.log) {
+	if prevLogIndex > rf.GetLogEntry(-1).Index {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 
 		reply.ConflictTerm = -1
-		reply.ConflictIndex = len(rf.log)
+		reply.ConflictIndex = rf.GetLogEntry(-1).Index + 1
 		rf.debug(
 			fmt.Sprintf("Follower Conflict: %d %d", reply.ConflictTerm, reply.ConflictIndex),
 			"success",
@@ -308,13 +342,13 @@ func (rf *Raft) AppendEntries(
 		return
 	}
 
-	if rf.log[prevLogIndex].Term != prevLogTerm {
+	if rf.GetLogEntry(prevLogIndex).Term != prevLogTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 
-		reply.ConflictTerm = rf.log[prevLogIndex].Term
+		reply.ConflictTerm = rf.GetLogEntry(prevLogIndex).Term
 		for i := prevLogIndex; i > 0; i -= 1 {
-			if rf.log[i-1].Term != reply.ConflictTerm {
+			if rf.GetLogEntry(i-1).Term != reply.ConflictTerm {
 				reply.ConflictIndex = i
 				break
 			}
@@ -329,20 +363,20 @@ func (rf *Raft) AppendEntries(
 
 	for i := 0; i < len(leaderLogEntries); i++ {
 		logIndex := prevLogIndex + i + 1
-		if logIndex < len(rf.log) && rf.log[logIndex].Term != leaderLogEntries[i].Term {
-			rf.log = rf.log[:logIndex]
+		if logIndex <= rf.GetLogEntry(-1).Index && rf.GetLogEntry(-1).Term != leaderLogEntries[i].Term {
+			rf.log = rf.log[:rf.GetIndex(logIndex)]
 		}
-		if logIndex >= len(rf.log) {
+		if logIndex > rf.GetLogEntry(-1).Index {
 			rf.log = append(rf.log, leaderLogEntries[i])
 		}
 	}
 
 	leaderCommit := args.LeaderCommit
 	if rf.commitIndex < leaderCommit {
-		if leaderCommit < len(rf.log)-1 {
+		if leaderCommit < rf.GetLogEntry(-1).Index {
 			rf.commitIndex = leaderCommit
 		} else {
-			rf.commitIndex = len(rf.log) - 1
+			rf.commitIndex = rf.GetLogEntry(-1).Index
 		}
 		rf.debug(fmt.Sprintf("-- Commit %d --", rf.commitIndex), "success")
 	}
@@ -360,7 +394,7 @@ func (rf *Raft) AppendEntries(
 			fmt.Sprintf(
 				"<- AppendEntries (%d - %v) -- %d",
 				prevLogIndex+1,
-				rf.log[prevLogIndex+1:],
+				rf.log[rf.GetIndex(prevLogIndex)+1:],
 				leaderId,
 			),
 			"success",
@@ -380,8 +414,8 @@ func (rf *Raft) sendRequestVote(
 	requestVoteArgs := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: len(rf.log) - 1,
-		LastLogTerm:  rf.log[len(rf.log)-1].Term,
+		LastLogIndex: rf.GetLogEntry(-1).Index,
+		LastLogTerm:  rf.GetLogEntry(-1).Term,
 	}
 	requestVoteReply := RequestVoteReply{}
 	rf.debug(
@@ -425,7 +459,7 @@ func (rf *Raft) sendRequestVote(
 		rf.debug("-- Leader --", "success")
 		rf.state = Leader
 		for i := 0; i < len(rf.peers); i++ {
-			rf.nextIndex[i] = len(rf.log)
+			rf.nextIndex[i] = rf.GetLogEntry(-1).Index + 1
 			rf.matchIndex[i] = 0
 		}
 		rf.mu.Unlock()
@@ -452,10 +486,13 @@ func (rf *Raft) sendAppendEntries(
 
 	startIndex := rf.nextIndex[server]
 	prevLogIndex := startIndex - 1
-	prevLogTerm := rf.log[prevLogIndex].Term
+	prevLogTerm := rf.GetLogEntry(prevLogIndex).Term
 
-	entries := make([]LogEntry, len(rf.log[startIndex:]))
-	copy(entries, rf.log[startIndex:])
+	entries := make(
+		[]LogEntry,
+		len(rf.log[rf.GetIndex(startIndex):]),
+	)
+	copy(entries, rf.log[rf.GetIndex(startIndex):])
 
 	appendEntriesArgs := AppendEntriesArgs{
 		Term:         rf.currentTerm,
@@ -471,7 +508,7 @@ func (rf *Raft) sendAppendEntries(
 		fmt.Sprintf(
 			"-- AppendEntries (%d - %v) -> %d",
 			startIndex,
-			rf.log[startIndex:],
+			rf.log[rf.GetIndex(startIndex):],
 			server,
 		),
 		"success",
@@ -510,8 +547,8 @@ func (rf *Raft) sendAppendEntries(
 		rf.matchIndex[server] = prevLogIndex + len(entries)
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 
-		for i := len(rf.log) - 1; i > rf.commitIndex; i-- {
-			if rf.log[i].Term != rf.currentTerm {
+		for i := rf.GetLogEntry(-1).Index; i > rf.commitIndex; i-- {
+			if rf.GetLogEntry(i).Term != rf.currentTerm {
 				continue
 			}
 			matchCount := 0
@@ -526,11 +563,11 @@ func (rf *Raft) sendAppendEntries(
 				break
 			}
 		}
-	} else if conflictIndex > 0 {
+	} else if conflictIndex != 0 {
 		rf.nextIndex[server] = conflictIndex
 		if conflictTerm > 0 {
-			for i := len(rf.log) - 1; i >= 1; i -= 1 {
-				if rf.log[i].Term == conflictTerm {
+			for i := rf.GetLogEntry(-1).Index; i > rf.lastIncludedIndex; i -= 1 {
+				if rf.GetLogEntry(i).Term == conflictTerm {
 					rf.nextIndex[server] = i + 1
 					break
 				}
@@ -593,13 +630,13 @@ func (rf *Raft) applyRoutine() {
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			rf.lastApplied = i
 			rf.debug(
-				fmt.Sprintf("-- Apply %d of %v --", i, rf.log),
+				fmt.Sprintf("-- Apply %v --", rf.GetLogEntry(i)),
 				"success",
 			)
 			applyMsg := ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[i].Command,
-				CommandIndex: i,
+				Command:      rf.GetLogEntry(i).Command,
+				CommandIndex: rf.GetLogEntry(i).Index,
 			}
 			rf.mu.Unlock()
 			rf.applyCh <- applyMsg
@@ -694,7 +731,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	index := len(rf.log)
+	index := rf.GetLogEntry(-1).Index + 1
 	term := rf.currentTerm
 	isLeader := rf.state == Leader
 
@@ -702,6 +739,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.log = append(rf.log, LogEntry{
 			Command: command,
 			Term:    term,
+			Index:   index,
 		})
 		rf.matchIndex[rf.me] = index
 		rf.nextIndex[rf.me] = index + 1
@@ -797,10 +835,8 @@ func Make(
 	rf.me = me
 
 	rf.log = make([]LogEntry, 0)
-	rf.log = append(rf.log, LogEntry{
-		Command: -1,
-		Term:    -1,
-	})
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = 0
 
 	rf.state = Follower
 	rf.currentTerm = 0
