@@ -19,7 +19,6 @@ package raft
 
 import (
 	"bytes"
-	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -78,7 +77,7 @@ type Raft struct {
 	matchIndex  []int         // index of highest log entry known to be replicated on each server
 	applyCh     chan ApplyMsg // the channel to send ApplyMsg
 
-	snapshot          []byte
+	snapshot []byte
 }
 
 type LogEntry struct {
@@ -227,8 +226,8 @@ func (rf *Raft) CondInstallSnapshot(
 	log := make([]LogEntry, 0)
 	log = append(log, LogEntry{
 		Command: -1,
-		Term: lastIncludedTerm,
-		Index: lastIncludedIndex,
+		Term:    lastIncludedTerm,
+		Index:   lastIncludedIndex,
 	})
 
 	if lastIncludedIndex <= rf.GetLogEntry(-1).Index && rf.GetLogEntry(lastIncludedIndex).Term == lastIncludedTerm {
@@ -236,11 +235,6 @@ func (rf *Raft) CondInstallSnapshot(
 	} else {
 		rf.log = log
 	}
-
-	rf.debug(
-		fmt.Sprintf("-- CondInstallSnapshot %d %d %v --", lastIncludedIndex, lastIncludedTerm, snapshot),
-		"success",
-	)
 
 	rf.snapshot = snapshot
 	rf.lastApplied = lastIncludedIndex
@@ -263,16 +257,11 @@ func (rf *Raft) Snapshot(
 	log := make([]LogEntry, 0)
 	log = append(log, LogEntry{
 		Command: -1,
-		Term: rf.GetLogEntry(index).Term,
-		Index: rf.GetLogEntry(index).Index,
+		Term:    rf.GetLogEntry(index).Term,
+		Index:   rf.GetLogEntry(index).Index,
 	})
-	rf.log = append(log, rf.log[rf.GetIndex(index + 1):]...)
+	rf.log = append(log, rf.log[rf.GetIndex(index+1):]...)
 	rf.snapshot = snapshot
-
-	rf.debug(
-		fmt.Sprintf("-- Snapshot %d --", index),
-		"success",
-	)
 }
 
 func (rf *Raft) RequestVote(
@@ -286,16 +275,7 @@ func (rf *Raft) RequestVote(
 	candidateId := args.CandidateId
 	candidateTerm := args.Term
 
-	rf.debug(
-		fmt.Sprintf("<- RequestVote -- %d", candidateId),
-		"success",
-	)
-
 	if candidateTerm < rf.currentTerm {
-		rf.debug(
-			fmt.Sprintf("-- Stale Vote -> %d", rf.votedFor),
-			"error",
-		)
 		reply.Term = rf.currentTerm
 		return
 	}
@@ -313,26 +293,10 @@ func (rf *Raft) RequestVote(
 	localLastLogTerm := rf.GetLogEntry(-1).Term
 
 	if candidateLastLogTerm < localLastLogTerm {
-		rf.debug(
-			fmt.Sprintf(
-				"-- Stale Log Term (%d < %d) --",
-				candidateLastLogTerm,
-				localLastLogTerm,
-			),
-			"error",
-		)
 		return
 	}
 
 	if candidateLastLogTerm == localLastLogTerm && candidateLastLogIndex < localLastLogIndex {
-		rf.debug(
-			fmt.Sprintf(
-				"-- Stale Log Index (%d < %d) --",
-				candidateLastLogIndex,
-				localLastLogIndex,
-			),
-			"error",
-		)
 		return
 	}
 
@@ -340,15 +304,6 @@ func (rf *Raft) RequestVote(
 		rf.lastHeartbeat = time.Now()
 		rf.votedFor = candidateId
 		reply.VoteGranted = true
-		rf.debug(
-			fmt.Sprintf("-- Vote -> %d", rf.votedFor),
-			"success",
-		)
-	} else {
-		rf.debug(
-			fmt.Sprintf("-- Duplicate Vote -> %d", rf.votedFor),
-			"error",
-		)
 	}
 }
 
@@ -361,7 +316,6 @@ func (rf *Raft) AppendEntries(
 	defer rf.persist()
 
 	leaderTerm := args.Term
-	leaderId := args.LeaderId
 
 	if leaderTerm < rf.currentTerm {
 		reply.Success = false
@@ -384,10 +338,6 @@ func (rf *Raft) AppendEntries(
 	if prevLogIndex < rf.log[0].Index {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		rf.debug(
-			fmt.Sprintf("Stale AppendEntries %d < %d", prevLogIndex, rf.log[0].Index),
-			"error",
-		)
 		return
 	}
 
@@ -397,10 +347,6 @@ func (rf *Raft) AppendEntries(
 
 		reply.ConflictTerm = -1
 		reply.ConflictIndex = rf.GetLogEntry(-1).Index + 1
-		rf.debug(
-			fmt.Sprintf("Follower Conflict: %d %d", reply.ConflictTerm, reply.ConflictIndex),
-			"success",
-		)
 		return
 	}
 
@@ -416,11 +362,6 @@ func (rf *Raft) AppendEntries(
 			}
 			reply.ConflictIndex = i
 		}
-
-		rf.debug(
-			fmt.Sprintf("Follower Conflict: %d %d", reply.ConflictTerm, reply.ConflictIndex),
-			"success",
-		)
 		return
 	}
 
@@ -441,28 +382,10 @@ func (rf *Raft) AppendEntries(
 		} else {
 			rf.commitIndex = rf.GetLogEntry(-1).Index
 		}
-		rf.debug(fmt.Sprintf("-- Commit %d --", rf.commitIndex), "success")
 	}
 
 	reply.Success = true
 	reply.Term = rf.currentTerm
-
-	if len(leaderLogEntries) == 0 {
-		rf.debug(
-			fmt.Sprintf("<- Heartbeat -- %d", leaderId),
-			"success",
-		)
-	} else {
-		rf.debug(
-			fmt.Sprintf(
-				"<- AppendEntries (%d - %v) -- %d",
-				prevLogIndex+1,
-				rf.log[rf.GetIndex(prevLogIndex)+1:],
-				leaderId,
-			),
-			"success",
-		)
-	}
 }
 
 func (rf *Raft) InstallSnapshot(
@@ -473,7 +396,6 @@ func (rf *Raft) InstallSnapshot(
 	defer rf.mu.Unlock()
 	defer rf.persist()
 
-	leaderId := args.LeaderId
 	leaderTerm := args.Term
 	snapshot := args.Data
 	done := args.Done
@@ -509,11 +431,6 @@ func (rf *Raft) InstallSnapshot(
 		rf.applyCh <- applyMsg
 		rf.mu.Lock()
 	}
-
-	rf.debug(
-		fmt.Sprintf("<- InstallSnapshot %d %d -- %d", lastIncludedIndex, lastIncludedTerm, leaderId),
-		"success",
-	)
 }
 
 func (rf *Raft) sendRequestVote(
@@ -532,10 +449,6 @@ func (rf *Raft) sendRequestVote(
 		LastLogTerm:  rf.GetLogEntry(-1).Term,
 	}
 	requestVoteReply := RequestVoteReply{}
-	rf.debug(
-		fmt.Sprintf("-- RequestVote -> %d", server),
-		"success",
-	)
 	rf.mu.Unlock()
 
 	rf.sendRequestVoteRPC(
@@ -563,14 +476,9 @@ func (rf *Raft) sendRequestVote(
 
 	if voteGranted {
 		rf.voteCount += 1
-		rf.debug(
-			fmt.Sprintf("<- Vote -- %d", server),
-			"success",
-		)
 	}
 
 	if rf.voteCount == len(rf.peers)/2+1 {
-		rf.debug("-- Leader --", "success")
 		rf.state = Leader
 		for i := 0; i < len(rf.peers); i++ {
 			rf.nextIndex[i] = rf.GetLogEntry(-1).Index + 1
@@ -623,19 +531,7 @@ func (rf *Raft) sendAppendEntries(
 	}
 	appendEntriesReply := AppendEntriesReply{}
 
-	rf.debug(
-		fmt.Sprintf(
-			"-- AppendEntries (%d %d %d - %v) -> %d",
-			startIndex,
-			prevLogIndex,
-			prevLogTerm,
-			rf.log[rf.GetIndex(startIndex):],
-			server,
-		),
-		"success",
-	)
 	rf.mu.Unlock()
-
 	ok := rf.sendAppendEntriesRPC(
 		server,
 		&appendEntriesArgs,
@@ -644,7 +540,6 @@ func (rf *Raft) sendAppendEntries(
 	if !ok {
 		return
 	}
-
 	rf.mu.Lock()
 
 	success := appendEntriesReply.Success
@@ -694,11 +589,6 @@ func (rf *Raft) sendAppendEntries(
 				}
 			}
 		}
-
-		rf.debug(
-			fmt.Sprintf("Conflict: %d %d %d", conflictTerm, conflictIndex, rf.nextIndex[server]),
-			"success",
-		)
 	}
 
 	rf.mu.Unlock()
@@ -724,16 +614,6 @@ func (rf *Raft) sendInstallSnapshot(
 	}
 	installSnapshotReply := InstallSnapshotReply{}
 
-	rf.debug(
-		fmt.Sprintf(
-			"-- InstallSnapshot %d %d -> %d",
-			rf.log[0].Index,
-			rf.log[0].Term,
-			server,
-		),
-		"success",
-	)
-
 	rf.mu.Unlock()
 	ok := rf.sendInstallSnapshotRPC(
 		server,
@@ -743,10 +623,9 @@ func (rf *Raft) sendInstallSnapshot(
 	if !ok {
 		return
 	}
-
 	rf.mu.Lock()
-	term := installSnapshotReply.Term
 
+	term := installSnapshotReply.Term
 	if term > rf.currentTerm {
 		rf.state = Follower
 		rf.votedFor = -1
@@ -774,15 +653,6 @@ func (rf *Raft) electionRoutine() {
 
 		if rf.state != Leader && time.Since(rf.lastHeartbeat) >= electionTimeout {
 			rf.state = Candidate
-			rf.debug(
-				fmt.Sprintf(
-					"-- Election (Timeout: %d ms, Since Last: %d ms) --",
-					electionTimeout.Milliseconds(),
-					time.Since(rf.lastHeartbeat).Milliseconds(),
-				),
-				"success",
-			)
-
 			rf.currentTerm += 1
 			rf.voteCount = 1
 			rf.votedFor = rf.me
@@ -810,15 +680,12 @@ func (rf *Raft) applyRoutine() {
 		rf.mu.Lock()
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			rf.lastApplied = i
-			rf.debug(
-				fmt.Sprintf("-- Apply %v --", rf.GetLogEntry(i)),
-				"success",
-			)
 			applyMsg := ApplyMsg{
 				CommandValid: true,
 				Command:      rf.GetLogEntry(i).Command,
 				CommandIndex: rf.GetLogEntry(i).Index,
 			}
+
 			rf.mu.Unlock()
 			rf.applyCh <- applyMsg
 			rf.mu.Lock()
@@ -941,11 +808,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.nextIndex[rf.me] = index + 1
 		rf.persist()
 
-		rf.debug(
-			fmt.Sprintf("-- Command %v (%d) in term %d --", command, index, term),
-			"success",
-		)
-
 		rf.mu.Unlock()
 		for server := range rf.peers {
 			if server == rf.me {
@@ -978,35 +840,6 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) debug(
-	message string,
-	level string,
-) {
-	debug := false
-	if !debug {
-		return
-	}
-
-	status := fmt.Sprintf(
-		"[Instance %d][State %d][Term %d][Commit %d][Applied %d][Last %d %d]",
-		rf.me,
-		rf.state,
-		rf.currentTerm,
-		rf.commitIndex,
-		rf.lastApplied,
-		rf.log[0].Index,
-		rf.log[0].Term,
-	)
-
-	if rf.state == Leader {
-		fmt.Println("\033[33m", status, message, rf.log, "\033[0m")
-	} else if level == "success" {
-		fmt.Println("\033[37m", status, message, rf.log, "\033[0m")
-	} else if level == "error" {
-		fmt.Println("\033[31m", status, message, rf.log, "\033[0m")
-	}
-}
-
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -1034,8 +867,8 @@ func Make(
 	rf.log = make([]LogEntry, 0)
 	rf.log = append(rf.log, LogEntry{
 		Command: 0,
-		Term: 0,
-		Index: 0,
+		Term:    0,
+		Index:   0,
 	})
 	rf.snapshot = make([]byte, 0)
 
