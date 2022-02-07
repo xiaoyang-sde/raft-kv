@@ -52,7 +52,6 @@ type ApplyMsg struct {
 	Command      interface{}
 	CommandIndex int
 
-	// For 2D:
 	SnapshotValid bool
 	Snapshot      []byte
 	SnapshotTerm  int
@@ -79,8 +78,6 @@ type Raft struct {
 	matchIndex  []int         // index of highest log entry known to be replicated on each server
 	applyCh     chan ApplyMsg // the channel to send ApplyMsg
 
-	lastIncludedTerm  int
-	lastIncludedIndex int
 	snapshot          []byte
 }
 
@@ -114,8 +111,8 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Success       bool
 	Term          int
-	ConflictTerm  int // term in the conflicting entry
-	ConflictIndex int // index of first entry with that term
+	ConflictTerm  int
+	ConflictIndex int
 }
 
 type InstallSnapshotArgs struct {
@@ -142,29 +139,14 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) GetIndex(
 	index int,
 ) int {
-	return index - rf.lastIncludedIndex - 1
+	return index - rf.log[0].Index
 }
 
 func (rf *Raft) GetLogEntry(
 	index int,
 ) LogEntry {
 	if index < 0 {
-		index += rf.lastIncludedIndex + len(rf.log) + 1
-	}
-	if index < rf.lastIncludedIndex {
-		panic(fmt.Sprintf("[Instance %d] %d %d", rf.me, index, rf.lastIncludedIndex))
-	}
-	if index == rf.lastIncludedIndex {
-		return LogEntry{
-			Index: rf.lastIncludedIndex,
-			Term:  rf.lastIncludedTerm,
-		}
-	}
-	if rf.GetIndex(index) >= len(rf.log) {
-		return LogEntry{
-			Index: -1,
-			Term:  -1,
-		}
+		index += rf.log[0].Index + len(rf.log)
 	}
 	return rf.log[rf.GetIndex(index)]
 }
@@ -179,8 +161,6 @@ func (rf *Raft) persist() {
 	encoder := labgob.NewEncoder(writer)
 	encoder.Encode(rf.currentTerm)
 	encoder.Encode(rf.votedFor)
-	encoder.Encode(rf.lastIncludedIndex)
-	encoder.Encode(rf.lastIncludedTerm)
 	encoder.Encode(rf.log)
 	data := writer.Bytes()
 	rf.persister.SaveStateAndSnapshot(data, rf.snapshot)
@@ -202,8 +182,6 @@ func (rf *Raft) readPersist(
 
 	var currentTerm int
 	var votedFor int
-	var lastIncludedIndex int
-	var lastIncludedTerm int
 	var log []LogEntry
 
 	if decoder.Decode(&currentTerm) == nil {
@@ -218,22 +196,10 @@ func (rf *Raft) readPersist(
 		return
 	}
 
-	if decoder.Decode(&lastIncludedIndex) == nil {
-		rf.lastIncludedIndex = lastIncludedIndex
-		rf.lastApplied = lastIncludedIndex
-		rf.commitIndex = lastIncludedIndex
-	} else {
-		return
-	}
-
-	if decoder.Decode(&lastIncludedTerm) == nil {
-		rf.lastIncludedTerm = lastIncludedTerm
-	} else {
-		return
-	}
-
 	if decoder.Decode(&log) == nil {
 		rf.log = log
+		rf.lastApplied = rf.log[0].Index
+		rf.commitIndex = rf.log[0].Index
 	} else {
 		return
 	}
@@ -258,10 +224,17 @@ func (rf *Raft) CondInstallSnapshot(
 		return false
 	}
 
-	if rf.GetLogEntry(lastIncludedIndex).Term == lastIncludedTerm {
-		rf.log = rf.log[rf.GetIndex(lastIncludedIndex)+1:]
+	log := make([]LogEntry, 0)
+	log = append(log, LogEntry{
+		Command: -1,
+		Term: lastIncludedTerm,
+		Index: lastIncludedIndex,
+	})
+
+	if lastIncludedIndex <= rf.GetLogEntry(-1).Index && rf.GetLogEntry(lastIncludedIndex).Term == lastIncludedTerm {
+		rf.log = append(log, rf.log[rf.GetIndex(lastIncludedIndex)+1:]...)
 	} else {
-		rf.log = make([]LogEntry, 0)
+		rf.log = log
 	}
 
 	rf.debug(
@@ -270,8 +243,6 @@ func (rf *Raft) CondInstallSnapshot(
 	)
 
 	rf.snapshot = snapshot
-	rf.lastIncludedIndex = lastIncludedIndex
-	rf.lastIncludedTerm = lastIncludedTerm
 	rf.lastApplied = lastIncludedIndex
 	rf.commitIndex = lastIncludedIndex
 	return true
@@ -289,11 +260,14 @@ func (rf *Raft) Snapshot(
 	defer rf.mu.Unlock()
 	defer rf.persist()
 
-	lastIncludedEntry := rf.GetLogEntry(index)
+	log := make([]LogEntry, 0)
+	log = append(log, LogEntry{
+		Command: -1,
+		Term: rf.GetLogEntry(index).Term,
+		Index: rf.GetLogEntry(index).Index,
+	})
+	rf.log = append(log, rf.log[rf.GetIndex(index + 1):]...)
 	rf.snapshot = snapshot
-	rf.log = rf.log[rf.GetIndex(index+1):]
-	rf.lastIncludedIndex = lastIncludedEntry.Index
-	rf.lastIncludedTerm = lastIncludedEntry.Term
 
 	rf.debug(
 		fmt.Sprintf("-- Snapshot %d --", index),
@@ -407,11 +381,11 @@ func (rf *Raft) AppendEntries(
 	prevLogIndex := args.PrevLogIndex
 	prevLogTerm := args.PrevLogTerm
 
-	if prevLogIndex < rf.lastIncludedIndex {
+	if prevLogIndex < rf.log[0].Index {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		rf.debug(
-			fmt.Sprintf("Stale AppendEntries %d < %d", prevLogIndex, rf.lastIncludedIndex),
+			fmt.Sprintf("Stale AppendEntries %d < %d", prevLogIndex, rf.log[0].Index),
 			"error",
 		)
 		return
@@ -436,7 +410,7 @@ func (rf *Raft) AppendEntries(
 
 		reply.ConflictTerm = rf.GetLogEntry(prevLogIndex).Term
 
-		for i := prevLogIndex; i >= rf.lastIncludedIndex; i -= 1 {
+		for i := prevLogIndex; i >= rf.log[0].Index; i -= 1 {
 			if rf.GetLogEntry(i).Term != reply.ConflictTerm {
 				break
 			}
@@ -625,7 +599,7 @@ func (rf *Raft) sendAppendEntries(
 	}
 
 	startIndex := rf.nextIndex[server]
-	if startIndex <= rf.lastIncludedIndex {
+	if startIndex <= rf.log[0].Index {
 		rf.mu.Unlock()
 		return
 	}
@@ -713,7 +687,7 @@ func (rf *Raft) sendAppendEntries(
 	} else if conflictIndex != 0 {
 		rf.nextIndex[server] = conflictIndex
 		if conflictTerm > 0 {
-			for i := rf.GetLogEntry(-1).Index; i > rf.lastIncludedIndex; i -= 1 {
+			for i := rf.GetLogEntry(-1).Index; i > rf.log[0].Index; i -= 1 {
 				if rf.GetLogEntry(i).Term == conflictTerm {
 					rf.nextIndex[server] = i + 1
 					break
@@ -742,8 +716,8 @@ func (rf *Raft) sendInstallSnapshot(
 	installSnapshotArgs := InstallSnapshotArgs{
 		Term:              rf.currentTerm,
 		LeaderId:          rf.me,
-		LastIncludedIndex: rf.lastIncludedIndex,
-		LastIncludedTerm:  rf.lastIncludedTerm,
+		LastIncludedIndex: rf.log[0].Index,
+		LastIncludedTerm:  rf.log[0].Term,
 		Offset:            0,
 		Data:              rf.snapshot,
 		Done:              true,
@@ -753,8 +727,8 @@ func (rf *Raft) sendInstallSnapshot(
 	rf.debug(
 		fmt.Sprintf(
 			"-- InstallSnapshot %d %d -> %d",
-			rf.lastIncludedIndex,
-			rf.lastIncludedTerm,
+			rf.log[0].Index,
+			rf.log[0].Term,
 			server,
 		),
 		"success",
@@ -785,7 +759,7 @@ func (rf *Raft) sendInstallSnapshot(
 		return
 	}
 
-	rf.matchIndex[server] = rf.lastIncludedIndex
+	rf.matchIndex[server] = rf.log[0].Index
 	rf.nextIndex[server] = rf.matchIndex[server] + 1
 	rf.mu.Unlock()
 }
@@ -863,7 +837,7 @@ func (rf *Raft) replicationRoutine() {
 				if server == rf.me {
 					continue
 				}
-				if rf.nextIndex[server] <= rf.lastIncludedIndex {
+				if rf.nextIndex[server] <= rf.log[0].Index {
 					rf.mu.Unlock()
 					go rf.sendInstallSnapshot(server)
 					rf.mu.Lock()
@@ -997,7 +971,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
 }
 
 func (rf *Raft) killed() bool {
@@ -1021,8 +994,8 @@ func (rf *Raft) debug(
 		rf.currentTerm,
 		rf.commitIndex,
 		rf.lastApplied,
-		rf.lastIncludedIndex,
-		rf.lastIncludedTerm,
+		rf.log[0].Index,
+		rf.log[0].Term,
 	)
 
 	if rf.state == Leader {
@@ -1059,8 +1032,11 @@ func Make(
 	rf.me = me
 
 	rf.log = make([]LogEntry, 0)
-	rf.lastIncludedIndex = 0
-	rf.lastIncludedTerm = 0
+	rf.log = append(rf.log, LogEntry{
+		Command: 0,
+		Term: 0,
+		Index: 0,
+	})
 	rf.snapshot = make([]byte, 0)
 
 	rf.state = Follower
