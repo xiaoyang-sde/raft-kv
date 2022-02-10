@@ -76,6 +76,7 @@ type Raft struct {
 	nextIndex   []int         // inidex of the next log entry to send to each server
 	matchIndex  []int         // index of highest log entry known to be replicated on each server
 	applyCh     chan ApplyMsg // the channel to send ApplyMsg
+	applyCond   *sync.Cond	  // the condition variable for the applyRoutine
 
 	snapshot []byte
 }
@@ -382,6 +383,7 @@ func (rf *Raft) AppendEntries(
 		} else {
 			rf.commitIndex = rf.GetLogEntry(-1).Index
 		}
+		rf.applyCond.Signal()
 	}
 
 	reply.Success = true
@@ -576,6 +578,7 @@ func (rf *Raft) sendAppendEntries(
 
 			if matchCount > len(rf.peers)/2 {
 				rf.commitIndex = i
+				rf.applyCond.Signal()
 				break
 			}
 		}
@@ -678,21 +681,18 @@ func (rf *Raft) electionRoutine() {
 func (rf *Raft) applyRoutine() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-			rf.lastApplied = i
-			applyMsg := ApplyMsg{
-				CommandValid: true,
-				Command:      rf.GetLogEntry(i).Command,
-				CommandIndex: rf.GetLogEntry(i).Index,
-			}
+		for rf.lastApplied >= rf.commitIndex {
+			rf.applyCond.Wait()
+		}
 
-			rf.mu.Unlock()
-			rf.applyCh <- applyMsg
-			rf.mu.Lock()
+		rf.lastApplied += 1
+		applyMsg := ApplyMsg{
+			CommandValid: true,
+			Command:      rf.GetLogEntry(rf.lastApplied).Command,
+			CommandIndex: rf.GetLogEntry(rf.lastApplied).Index,
 		}
 		rf.mu.Unlock()
-
-		time.Sleep(5 * time.Millisecond)
+		rf.applyCh <- applyMsg
 	}
 }
 
@@ -878,6 +878,7 @@ func Make(
 	rf.lastHeartbeat = time.Now()
 
 	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.matchIndex = make([]int, len(peers))
