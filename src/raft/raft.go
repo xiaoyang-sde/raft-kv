@@ -58,7 +58,7 @@ type ApplyMsg struct {
 }
 
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -130,8 +130,8 @@ type InstallSnapshotReply struct {
 }
 
 func (rf *Raft) GetState() (int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
 
 	return rf.currentTerm, rf.state == Leader
 }
@@ -438,9 +438,9 @@ func (rf *Raft) InstallSnapshot(
 func (rf *Raft) sendRequestVote(
 	server int,
 ) {
-	rf.mu.Lock()
+	rf.mu.RLock()
 	if rf.state != Candidate {
-		rf.mu.Unlock()
+		rf.mu.RUnlock()
 		return
 	}
 
@@ -451,7 +451,7 @@ func (rf *Raft) sendRequestVote(
 		LastLogTerm:  rf.GetLogEntry(-1).Term,
 	}
 	requestVoteReply := RequestVoteReply{}
-	rf.mu.Unlock()
+	rf.mu.RUnlock()
 
 	rf.sendRequestVoteRPC(
 		server,
@@ -502,15 +502,15 @@ func (rf *Raft) sendRequestVote(
 func (rf *Raft) sendAppendEntries(
 	server int,
 ) {
-	rf.mu.Lock()
+	rf.mu.RLock()
 	if rf.state != Leader {
-		rf.mu.Unlock()
+		rf.mu.RUnlock()
 		return
 	}
 
 	startIndex := rf.nextIndex[server]
 	if startIndex <= rf.log[0].Index {
-		rf.mu.Unlock()
+		rf.mu.RUnlock()
 		return
 	}
 
@@ -533,7 +533,7 @@ func (rf *Raft) sendAppendEntries(
 	}
 	appendEntriesReply := AppendEntriesReply{}
 
-	rf.mu.Unlock()
+	rf.mu.RUnlock()
 	ok := rf.sendAppendEntriesRPC(
 		server,
 		&appendEntriesArgs,
@@ -600,9 +600,9 @@ func (rf *Raft) sendAppendEntries(
 func (rf *Raft) sendInstallSnapshot(
 	server int,
 ) {
-	rf.mu.Lock()
+	rf.mu.RLock()
 	if rf.state != Leader {
-		rf.mu.Unlock()
+		rf.mu.RUnlock()
 		return
 	}
 
@@ -617,7 +617,7 @@ func (rf *Raft) sendInstallSnapshot(
 	}
 	installSnapshotReply := InstallSnapshotReply{}
 
-	rf.mu.Unlock()
+	rf.mu.RUnlock()
 	ok := rf.sendInstallSnapshotRPC(
 		server,
 		&installSnapshotArgs,
@@ -698,24 +698,23 @@ func (rf *Raft) applyRoutine() {
 
 func (rf *Raft) replicationRoutine() {
 	for !rf.killed() {
-		rf.mu.Lock()
+		rf.mu.RLock()
 		if rf.state == Leader {
 			for server := range rf.peers {
 				if server == rf.me {
 					continue
 				}
 				if rf.nextIndex[server] <= rf.log[0].Index {
-					rf.mu.Unlock()
+					rf.mu.RUnlock()
 					go rf.sendInstallSnapshot(server)
-					rf.mu.Lock()
 				} else {
-					rf.mu.Unlock()
+					rf.mu.RUnlock()
 					go rf.sendAppendEntries(server)
-					rf.mu.Lock()
 				}
+				rf.mu.RLock()
 			}
 		}
-		rf.mu.Unlock()
+		rf.mu.RUnlock()
 		time.Sleep(HEART_BEAT_TIMEOUT * time.Millisecond)
 	}
 }
