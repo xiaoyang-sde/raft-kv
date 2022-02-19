@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,32 +18,117 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Key   string
+	Value string
+	Op    string
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
+	mu           sync.Mutex
+	me           int
+	rf           *raft.Raft
+	applyCh      chan raft.ApplyMsg
+	dead         int32 // set by Kill()
+	maxraftstate int   // snapshot if log grows this big
 
-	maxraftstate int // snapshot if log grows this big
-
-	// Your definitions here.
+	state   map[string]string
+	applied map[int]bool
+	cond    *sync.Cond
 }
 
+func (kv *KVServer) applyRoutine() {
+	for !kv.killed() {
+		applyMsg := <-kv.applyCh
+		kv.mu.Lock()
 
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+		command := applyMsg.Command.(Op)
+		commandValid := applyMsg.CommandValid
+		commandIndex := applyMsg.CommandIndex
+		if commandValid {
+			op := command.Op
+			key := command.Key
+			value := command.Value
+
+			switch op {
+			case "Put":
+				kv.state[key] = value
+			case "Append":
+				kv.state[key] += value
+			}
+
+			kv.applied[commandIndex] = true
+			DPrintf("[%v] %v (%v, %v) - broadcast\n", kv.me, op, key, value)
+			kv.cond.Broadcast()
+		}
+
+		kv.mu.Unlock()
+	}
 }
 
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+func (kv *KVServer) Get(
+	args *GetArgs,
+	reply *GetReply,
+) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	key := args.Key
+	command := Op{
+		Key: key,
+		Op:  "Get",
+	}
+
+	index, _, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("[%d] Get %v - started\n", kv.me, key)
+
+	for !kv.applied[index] {
+		kv.cond.Wait()
+	}
+	DPrintf("[%d] Get %v - applied\n", kv.me, key)
+
+	value, ok := kv.state[key]
+	if ok {
+		reply.Value = value
+		reply.Err = OK
+	} else {
+		reply.Value = ""
+		reply.Err = ErrNoKey
+	}
+}
+
+func (kv *KVServer) PutAppend(
+	args *PutAppendArgs,
+	reply *PutAppendReply,
+) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	key := args.Key
+	value := args.Value
+	op := args.Op
+	command := Op{
+		Key:   key,
+		Value: value,
+		Op:    op,
+	}
+
+	index, _, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("[%d] %v (%v, %v) - started\n", kv.me, op, key, value)
+
+	for !kv.applied[index] {
+		kv.cond.Wait()
+	}
+	DPrintf("[%d] %v (%v, %v) - applied\n", kv.me, op, key, value)
+	reply.Err = OK
 }
 
 //
@@ -90,12 +175,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
-	// You may need initialization code here.
-
+	kv.state = make(map[string]string)
+	kv.applied = make(map[int]bool)
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.cond = sync.NewCond(&kv.mu)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
-
+	go kv.applyRoutine()
 	return kv
 }
