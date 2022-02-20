@@ -5,8 +5,10 @@ import "crypto/rand"
 import "math/big"
 
 type Clerk struct {
-	servers []*labrpc.ClientEnd
-	leader  int
+	servers   []*labrpc.ClientEnd
+	leader    int
+	clientId  int64
+	messageId int
 }
 
 func nrand() int64 {
@@ -20,6 +22,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	ck.leader = 0
+	ck.clientId = nrand()
+	ck.messageId = 1
 	return ck
 }
 
@@ -39,11 +43,11 @@ func (ck *Clerk) Get(
 	key string,
 ) string {
 	index := ck.leader
-	id := nrand()
 	for {
 		args := GetArgs{
-			Id:  id,
-			Key: key,
+			ClientId:  ck.clientId,
+			MessageId: ck.messageId,
+			Key:       key,
 		}
 		reply := GetReply{}
 
@@ -51,14 +55,11 @@ func (ck *Clerk) Get(
 		err := reply.Err
 		value := reply.Value
 
-		switch err {
-		case ErrNoKey:
+		if err == ErrNoKey || err == OK {
 			ck.leader = index % len(ck.servers)
-			return ""
-		case OK:
-			ck.leader = index % len(ck.servers)
+			ck.messageId += 1
 			return value
-		default:
+		} else if err == ErrWrongLeader {
 			index += 1
 		}
 	}
@@ -80,23 +81,24 @@ func (ck *Clerk) PutAppend(
 	op string,
 ) {
 	index := ck.leader
-	id := nrand()
 	for {
 		args := PutAppendArgs{
-			Id:    id,
-			Key:   key,
-			Value: value,
-			Op:    op,
+			ClientId:  ck.clientId,
+			MessageId: ck.messageId,
+			Key:       key,
+			Value:     value,
+			Op:        op,
 		}
 		reply := PutAppendReply{}
 
 		ck.servers[index%len(ck.servers)].Call("KVServer.PutAppend", &args, &reply)
 		err := reply.Err
-		switch err {
-		case OK:
+
+		if err == OK {
 			ck.leader = index % len(ck.servers)
+			ck.messageId += 1
 			return
-		default:
+		} else if err == ErrNoKey {
 			index += 1
 		}
 	}

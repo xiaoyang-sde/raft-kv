@@ -12,7 +12,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -22,16 +22,16 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 type Op struct {
-	Id    int64
-	Key   string
-	Value string
-	Op    string
+	ClientId  int64
+	MessageId int
+	Key       string
+	Value     string
+	Op        string
 }
 
 type Snapshot struct {
-	State map[string]string
-	Index   map[int]int64
-	Applied map[int64]bool
+	State  map[string]string
+	Client map[int64]int
 }
 
 type KVServer struct {
@@ -43,34 +43,24 @@ type KVServer struct {
 	maxraftstate int   // snapshot if log grows this big
 	persister    *raft.Persister
 
-	cond    *sync.Cond
-	state   map[string]string
-	index   map[int]int64
-	applied map[int64]bool
-	term    int
-}
-
-func (kv *KVServer) broadcastRoutine() {
-	for !kv.killed() {
-		kv.cond.Broadcast()
-		time.Sleep(250 * time.Millisecond)
-	}
+	state     map[string]string
+	client    map[int64]int
+	appliedId map[int]int
+	cond      *sync.Cond
 }
 
 func (kv *KVServer) snapshot(
 	index int,
 ) {
 	snapshot := Snapshot{
-		State: kv.state,
-		Index: kv.index,
-		Applied: kv.applied,
+		State:  kv.state,
+		Client: kv.client,
 	}
 
 	writer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(writer)
 	encoder.Encode(snapshot)
-	DPrintf("[%d] Snapshot at %d\n", kv.me, index)
-
+	DPrintf("[%d] %d - snapshot\n", kv.me, index)
 	kv.rf.Snapshot(index, writer.Bytes())
 }
 
@@ -86,10 +76,16 @@ func (kv *KVServer) readPersist(
 	var decodeSnapshot Snapshot
 	if err := decoder.Decode(&decodeSnapshot); err == nil {
 		kv.state = decodeSnapshot.State
-		kv.index = decodeSnapshot.Index
-		kv.applied = decodeSnapshot.Applied
+		kv.client = decodeSnapshot.Client
 	} else {
 		panic(err)
+	}
+}
+
+func (kv *KVServer) broadcastRoutine() {
+	for !kv.killed() {
+		kv.cond.Broadcast()
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
@@ -103,24 +99,25 @@ func (kv *KVServer) applyRoutine() {
 			command := applyMsg.Command.(Op)
 			commandIndex := applyMsg.CommandIndex
 
-			id := command.Id
+			messageId := command.MessageId
+			clientId := command.ClientId
 			op := command.Op
 			key := command.Key
 			value := command.Value
 
-			if !kv.applied[id] {
+			if kv.client[clientId] < messageId {
 				switch op {
 				case "Put":
 					kv.state[key] = value
 				case "Append":
 					kv.state[key] += value
 				}
-				kv.applied[id] = true
+				kv.client[clientId] = messageId
 			}
 
-			kv.index[commandIndex] = id
-			DPrintf("[%v][%d] %v (%v, %v) - broadcast\n", kv.me, id, op, key, value)
+			kv.appliedId[commandIndex] = messageId
 			kv.cond.Broadcast()
+			DPrintf("[%v][%d][%d] %v (%v, %v) - broadcast\n", kv.me, clientId, messageId, op, key, value)
 
 			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
 				kv.snapshot(commandIndex)
@@ -148,37 +145,42 @@ func (kv *KVServer) Get(
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	id := args.Id
+	clientId := args.ClientId
+	messageId := args.MessageId
 	key := args.Key
 	command := Op{
-		Id:  id,
-		Key: key,
-		Op:  "Get",
+		ClientId:  clientId,
+		MessageId: messageId,
+		Key:       key,
+		Op:        "Get",
 	}
 
-	index, term, isLeader := kv.rf.Start(command)
-	if !isLeader || term > kv.term {
-		kv.term = term
+	if messageId < kv.client[clientId] {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	DPrintf("[%d][%d] Get %v - started\n", kv.me, id, key)
+
+	index, _, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("[%d][%d][%d] Get %v - started\n", kv.me, clientId, messageId, key)
 
 	timeout := time.Now().Add(500 * time.Millisecond)
-	for (kv.index[index] == 0) {
+	for kv.appliedId[index] == 0 {
 		kv.cond.Wait()
 		if time.Now().After(timeout) {
 			reply.Err = ErrWrongLeader
+			DPrintf("[%d][%d][%d] Get %v - timeout\n", kv.me, clientId, messageId, key)
 			return
 		}
 	}
 
-	if kv.index[index] != id {
+	if kv.appliedId[index] != messageId {
 		reply.Err = ErrWrongLeader
 		return
 	}
-
-	DPrintf("[%d][%d] Get %v - applied\n", kv.me, id, key)
 
 	value, ok := kv.state[key]
 	if ok {
@@ -188,6 +190,7 @@ func (kv *KVServer) Get(
 		reply.Value = ""
 		reply.Err = ErrNoKey
 	}
+	DPrintf("[%d][%d][%d] Get %v = %v - applied\n", kv.me, clientId, messageId, key, value)
 }
 
 func (kv *KVServer) PutAppend(
@@ -197,41 +200,48 @@ func (kv *KVServer) PutAppend(
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	id := args.Id
+	clientId := args.ClientId
+	messageId := args.MessageId
 	key := args.Key
 	value := args.Value
 	op := args.Op
 	command := Op{
-		Id:    id,
-		Key:   key,
-		Value: value,
-		Op:    op,
+		ClientId:  clientId,
+		MessageId: messageId,
+		Key:       key,
+		Value:     value,
+		Op:        op,
 	}
 
-	index, term, isLeader := kv.rf.Start(command)
-	if !isLeader || term > kv.term {
-		kv.term = term
+	if messageId < kv.client[clientId] {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
-	DPrintf("[%d][%d] %v (%v, %v) - started\n", kv.me, id, op, key, value)
+	index, _, isLeader := kv.rf.Start(command)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	DPrintf("[%d][%d][%d] %v (%v, %v) - started\n", kv.me, clientId, messageId, op, key, value)
 
 	timeout := time.Now().Add(500 * time.Millisecond)
-	for (kv.index[index] == 0) {
+	for kv.appliedId[index] == 0 {
 		kv.cond.Wait()
 		if time.Now().After(timeout) {
 			reply.Err = ErrWrongLeader
+			DPrintf("[%d][%d][%d] %v (%v, %v) - timeout\n", kv.me, clientId, messageId, op, key, value)
 			return
 		}
 	}
 
-	if kv.index[index] != id {
+	if kv.appliedId[index] != messageId {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
-	DPrintf("[%d][%d] %v (%v, %v) - index\n", kv.me, id, op, key, value)
+	DPrintf("[%d][%d][%d] %v (%v, %v) - applied\n", kv.me, clientId, messageId, op, key, value)
 	reply.Err = OK
 }
 
@@ -270,7 +280,12 @@ func (kv *KVServer) killed() bool {
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
 //
-func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
+func StartKVServer(
+	servers []*labrpc.ClientEnd,
+	me int,
+	persister *raft.Persister,
+	maxraftstate int,
+) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
@@ -281,15 +296,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	kv.state = make(map[string]string)
-	kv.index = make(map[int]int64)
-	kv.applied = make(map[int64]bool)
+	kv.client = make(map[int64]int)
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.appliedId = make(map[int]int)
 	kv.cond = sync.NewCond(&kv.mu)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.persister = persister
-	kv.term = 1
 
 	kv.readPersist(kv.persister.ReadSnapshot())
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	go kv.applyRoutine()
 	go kv.broadcastRoutine()
