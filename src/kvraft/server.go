@@ -4,6 +4,7 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"time"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,13 @@ type KVServer struct {
 	term    int
 }
 
+func (kv *KVServer) broadcastRoutine() {
+	for !kv.killed() {
+		kv.cond.Broadcast()
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
 func (kv *KVServer) applyRoutine() {
 	for !kv.killed() {
 		applyMsg := <-kv.applyCh
@@ -65,7 +73,7 @@ func (kv *KVServer) applyRoutine() {
 			}
 
 			kv.index[commandIndex] = id
-			DPrintf("[%v] %v (%v, %v) - broadcast\n", kv.me, op, key, value)
+			DPrintf("[%v][%d] %v (%v, %v) - broadcast\n", kv.me, id, op, key, value)
 			kv.cond.Broadcast()
 		}
 
@@ -94,10 +102,15 @@ func (kv *KVServer) Get(
 		reply.Err = ErrWrongLeader
 		return
 	}
-	DPrintf("[%d] Get %v - started\n", kv.me, key)
+	DPrintf("[%d][%d] Get %v - started\n", kv.me, id, key)
 
-	for kv.index[index] == 0 {
+	timeout := time.Now().Add(500 * time.Millisecond)
+	for (kv.index[index] == 0) {
 		kv.cond.Wait()
+		if time.Now().After(timeout) {
+			reply.Err = ErrWrongLeader
+			return
+		}
 	}
 
 	if kv.index[index] != id {
@@ -105,7 +118,7 @@ func (kv *KVServer) Get(
 		return
 	}
 
-	DPrintf("[%d] Get %v - index\n", kv.me, key)
+	DPrintf("[%d][%d] Get %v - applied\n", kv.me, id, key)
 
 	value, ok := kv.state[key]
 	if ok {
@@ -142,10 +155,15 @@ func (kv *KVServer) PutAppend(
 		return
 	}
 
-	DPrintf("[%d] %v (%v, %v) - started\n", kv.me, op, key, value)
+	DPrintf("[%d][%d] %v (%v, %v) - started\n", kv.me, id, op, key, value)
 
-	for kv.index[index] == 0 {
+	timeout := time.Now().Add(500 * time.Millisecond)
+	for (kv.index[index] == 0) {
 		kv.cond.Wait()
+		if time.Now().After(timeout) {
+			reply.Err = ErrWrongLeader
+			return
+		}
 	}
 
 	if kv.index[index] != id {
@@ -153,7 +171,7 @@ func (kv *KVServer) PutAppend(
 		return
 	}
 
-	DPrintf("[%d] %v (%v, %v) - index\n", kv.me, op, key, value)
+	DPrintf("[%d][%d] %v (%v, %v) - index\n", kv.me, id, op, key, value)
 	reply.Err = OK
 }
 
@@ -210,5 +228,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.term = 1
 
 	go kv.applyRoutine()
+	go kv.broadcastRoutine()
 	return kv
 }

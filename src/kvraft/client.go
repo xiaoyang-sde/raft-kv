@@ -50,15 +50,17 @@ func (ck *Clerk) Get(
 		ck.servers[index%len(ck.servers)].Call("KVServer.Get", &args, &reply)
 		err := reply.Err
 		value := reply.Value
-		if err == ErrNoKey {
+
+		switch err {
+		case ErrNoKey:
 			ck.leader = index % len(ck.servers)
 			return ""
-		}
-		if err == OK {
+		case OK:
 			ck.leader = index % len(ck.servers)
 			return value
+		default:
+			index += 1
 		}
-		index += 1
 	}
 }
 
@@ -90,11 +92,13 @@ func (ck *Clerk) PutAppend(
 
 		ck.servers[index%len(ck.servers)].Call("KVServer.PutAppend", &args, &reply)
 		err := reply.Err
-		if err == OK {
+		switch err {
+		case OK:
 			ck.leader = index % len(ck.servers)
 			return
+		default:
+			index += 1
 		}
-		index += 1
 	}
 }
 

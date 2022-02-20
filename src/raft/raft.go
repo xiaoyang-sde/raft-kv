@@ -681,7 +681,7 @@ func (rf *Raft) electionRoutine() {
 func (rf *Raft) applyRoutine() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		for rf.lastApplied >= rf.commitIndex {
+		for rf.lastApplied == rf.commitIndex {
 			rf.applyCond.Wait()
 		}
 
