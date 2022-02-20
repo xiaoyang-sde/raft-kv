@@ -255,6 +255,10 @@ func (rf *Raft) Snapshot(
 	defer rf.mu.Unlock()
 	defer rf.persist()
 
+	if index < rf.log[0].Index {
+		return
+	}
+
 	log := make([]LogEntry, 0)
 	log = append(log, LogEntry{
 		Command: -1,

@@ -1,13 +1,15 @@
 package kvraft
 
 import (
-	"6.824/labgob"
-	"6.824/labrpc"
-	"6.824/raft"
-	"time"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.824/labgob"
+	"6.824/labrpc"
+	"6.824/raft"
 )
 
 const Debug = false
@@ -26,6 +28,12 @@ type Op struct {
 	Op    string
 }
 
+type Snapshot struct {
+	State map[string]string
+	Index   map[int]int64
+	Applied map[int64]bool
+}
+
 type KVServer struct {
 	mu           sync.Mutex
 	me           int
@@ -33,11 +41,12 @@ type KVServer struct {
 	applyCh      chan raft.ApplyMsg
 	dead         int32 // set by Kill()
 	maxraftstate int   // snapshot if log grows this big
+	persister    *raft.Persister
 
+	cond    *sync.Cond
 	state   map[string]string
 	index   map[int]int64
 	applied map[int64]bool
-	cond    *sync.Cond
 	term    int
 }
 
@@ -48,15 +57,52 @@ func (kv *KVServer) broadcastRoutine() {
 	}
 }
 
+func (kv *KVServer) snapshot(
+	index int,
+) {
+	snapshot := Snapshot{
+		State: kv.state,
+		Index: kv.index,
+		Applied: kv.applied,
+	}
+
+	writer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(writer)
+	encoder.Encode(snapshot)
+	DPrintf("[%d] Snapshot at %d\n", kv.me, index)
+
+	kv.rf.Snapshot(index, writer.Bytes())
+}
+
+func (kv *KVServer) readPersist(
+	snapshot []byte,
+) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+	reader := bytes.NewBuffer(snapshot)
+	decoder := labgob.NewDecoder(reader)
+
+	var decodeSnapshot Snapshot
+	if err := decoder.Decode(&decodeSnapshot); err == nil {
+		kv.state = decodeSnapshot.State
+		kv.index = decodeSnapshot.Index
+		kv.applied = decodeSnapshot.Applied
+	} else {
+		panic(err)
+	}
+}
+
 func (kv *KVServer) applyRoutine() {
 	for !kv.killed() {
 		applyMsg := <-kv.applyCh
 		kv.mu.Lock()
 
-		command := applyMsg.Command.(Op)
-		commandIndex := applyMsg.CommandIndex
 		commandValid := applyMsg.CommandValid
 		if commandValid {
+			command := applyMsg.Command.(Op)
+			commandIndex := applyMsg.CommandIndex
+
 			id := command.Id
 			op := command.Op
 			key := command.Key
@@ -75,6 +121,20 @@ func (kv *KVServer) applyRoutine() {
 			kv.index[commandIndex] = id
 			DPrintf("[%v][%d] %v (%v, %v) - broadcast\n", kv.me, id, op, key, value)
 			kv.cond.Broadcast()
+
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
+				kv.snapshot(commandIndex)
+			}
+		}
+
+		snapshotValid := applyMsg.SnapshotValid
+		if snapshotValid {
+			snapshot := applyMsg.Snapshot
+			snapshotTerm := applyMsg.SnapshotTerm
+			snapshotIndex := applyMsg.SnapshotIndex
+			if kv.rf.CondInstallSnapshot(snapshotTerm, snapshotIndex, snapshot) {
+				kv.readPersist(snapshot)
+			}
 		}
 
 		kv.mu.Unlock()
@@ -214,6 +274,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(Snapshot{})
 
 	kv := new(KVServer)
 	kv.me = me
@@ -225,7 +286,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.cond = sync.NewCond(&kv.mu)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persister = persister
 	kv.term = 1
+
+	kv.readPersist(kv.persister.ReadSnapshot())
 
 	go kv.applyRoutine()
 	go kv.broadcastRoutine()
