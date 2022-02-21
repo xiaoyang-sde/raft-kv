@@ -76,7 +76,7 @@ type Raft struct {
 	nextIndex   []int         // inidex of the next log entry to send to each server
 	matchIndex  []int         // index of highest log entry known to be replicated on each server
 	applyCh     chan ApplyMsg // the channel to send ApplyMsg
-	applyCond   *sync.Cond	  // the condition variable for the applyRoutine
+	applyCond   *sync.Cond    // the condition variable for the applyRoutine
 
 	snapshot []byte
 }
@@ -382,11 +382,7 @@ func (rf *Raft) AppendEntries(
 
 	leaderCommit := args.LeaderCommit
 	if rf.commitIndex < leaderCommit {
-		if leaderCommit < rf.GetLogEntry(-1).Index {
-			rf.commitIndex = leaderCommit
-		} else {
-			rf.commitIndex = rf.GetLogEntry(-1).Index
-		}
+		rf.commitIndex = Min(rf.GetLogEntry(-1).Index, leaderCommit)
 		rf.applyCond.Signal()
 	}
 
@@ -685,18 +681,28 @@ func (rf *Raft) electionRoutine() {
 func (rf *Raft) applyRoutine() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		for rf.lastApplied == rf.commitIndex {
+		for rf.lastApplied >= rf.commitIndex {
 			rf.applyCond.Wait()
 		}
 
-		rf.lastApplied += 1
-		applyMsg := ApplyMsg{
-			CommandValid: true,
-			Command:      rf.GetLogEntry(rf.lastApplied).Command,
-			CommandIndex: rf.GetLogEntry(rf.lastApplied).Index,
+		commitIndex := rf.commitIndex
+		queue := make([]ApplyMsg, 0)
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			queue = append(queue, ApplyMsg{
+				CommandValid: true,
+				Command:      rf.GetLogEntry(i).Command,
+				CommandIndex: rf.GetLogEntry(i).Index,
+			})
 		}
 		rf.mu.Unlock()
-		rf.applyCh <- applyMsg
+
+		for _, applyMsg := range queue {
+			rf.applyCh <- applyMsg
+		}
+
+		rf.mu.Lock()
+		rf.lastApplied = Max(rf.lastApplied, commitIndex)
+		rf.mu.Unlock()
 	}
 }
 

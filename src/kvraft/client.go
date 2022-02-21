@@ -27,86 +27,51 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	return ck
 }
 
-//
-// fetch the current value for a key.
-// returns "" if the key does not exist.
-// keeps trying forever in the face of all other errors.
-//
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("KVServer.Get", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
-//
-func (ck *Clerk) Get(
+func (ck *Clerk) Command(
 	key string,
+	value string,
+	method string,
 ) string {
 	index := ck.leader
 	for {
-		args := GetArgs{
+		args := CommandArgs{
 			ClientId:  ck.clientId,
 			MessageId: ck.messageId,
+			Method:    method,
 			Key:       key,
+			Value:     value,
 		}
-		reply := GetReply{}
+		reply := CommandReply{}
 
-		ck.servers[index%len(ck.servers)].Call("KVServer.Get", &args, &reply)
+		ok := ck.servers[index%len(ck.servers)].Call("KVServer.Command", &args, &reply)
 		err := reply.Err
 		value := reply.Value
 
-		if err == ErrNoKey || err == OK {
+		if !ok || err == ErrWrongLeader || err == ErrTimeout {
+			index += 1
+		} else {
 			ck.leader = index % len(ck.servers)
 			ck.messageId += 1
 			return value
-		} else if err == ErrWrongLeader {
-			index += 1
 		}
 	}
 }
 
-//
-// shared by Put and Append.
-//
-// you can send an RPC with code like this:
-// ok := ck.servers[i].Call("KVServer.PutAppend", &args, &reply)
-//
-// the types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. and reply must be passed as a pointer.
-//
-func (ck *Clerk) PutAppend(
+func (ck *Clerk) Get(
+	key string,
+) string {
+	return ck.Command(key, "", "Get")
+}
+
+func (ck *Clerk) Put(
 	key string,
 	value string,
-	op string,
 ) {
-	index := ck.leader
-	for {
-		args := PutAppendArgs{
-			ClientId:  ck.clientId,
-			MessageId: ck.messageId,
-			Key:       key,
-			Value:     value,
-			Op:        op,
-		}
-		reply := PutAppendReply{}
-
-		ck.servers[index%len(ck.servers)].Call("KVServer.PutAppend", &args, &reply)
-		err := reply.Err
-
-		if err == OK {
-			ck.leader = index % len(ck.servers)
-			ck.messageId += 1
-			return
-		} else if err == ErrNoKey {
-			index += 1
-		}
-	}
+	ck.Command(key, value, "Put")
 }
-
-func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
-}
-func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+func (ck *Clerk) Append(
+	key string,
+	value string,
+) {
+	ck.Command(key, value, "Append")
 }

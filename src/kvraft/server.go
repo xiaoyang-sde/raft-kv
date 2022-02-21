@@ -12,7 +12,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -21,12 +21,12 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-type Op struct {
+type Command struct {
 	ClientId  int64
 	MessageId int
 	Key       string
 	Value     string
-	Op        string
+	Method    string
 }
 
 type Snapshot struct {
@@ -35,7 +35,7 @@ type Snapshot struct {
 }
 
 type KVServer struct {
-	mu           sync.Mutex
+	mu           sync.RWMutex
 	me           int
 	rf           *raft.Raft
 	applyCh      chan raft.ApplyMsg
@@ -43,10 +43,9 @@ type KVServer struct {
 	maxraftstate int   // snapshot if log grows this big
 	persister    *raft.Persister
 
-	state     map[string]string
-	client    map[int64]int
-	appliedId map[int]int
-	cond      *sync.Cond
+	state    map[string]string
+	client   map[int64]int
+	clientCh map[int]chan Command
 }
 
 func (kv *KVServer) snapshot(
@@ -60,7 +59,10 @@ func (kv *KVServer) snapshot(
 	writer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(writer)
 	encoder.Encode(snapshot)
-	DPrintf("[%d] %d - snapshot\n", kv.me, index)
+	DPrintf(
+		"[%d] %d - snapshot\n",
+		kv.me, index,
+	)
 	kv.rf.Snapshot(index, writer.Bytes())
 }
 
@@ -82,13 +84,6 @@ func (kv *KVServer) readPersist(
 	}
 }
 
-func (kv *KVServer) broadcastRoutine() {
-	for !kv.killed() {
-		kv.cond.Broadcast()
-		time.Sleep(200 * time.Millisecond)
-	}
-}
-
 func (kv *KVServer) applyRoutine() {
 	for !kv.killed() {
 		applyMsg := <-kv.applyCh
@@ -96,17 +91,17 @@ func (kv *KVServer) applyRoutine() {
 
 		commandValid := applyMsg.CommandValid
 		if commandValid {
-			command := applyMsg.Command.(Op)
+			command := applyMsg.Command.(Command)
 			commandIndex := applyMsg.CommandIndex
 
 			messageId := command.MessageId
 			clientId := command.ClientId
-			op := command.Op
+			method := command.Method
 			key := command.Key
 			value := command.Value
 
 			if kv.client[clientId] < messageId {
-				switch op {
+				switch method {
 				case "Put":
 					kv.state[key] = value
 				case "Append":
@@ -115,9 +110,13 @@ func (kv *KVServer) applyRoutine() {
 				kv.client[clientId] = messageId
 			}
 
-			kv.appliedId[commandIndex] = messageId
-			kv.cond.Broadcast()
-			DPrintf("[%v][%d][%d] %v (%v, %v) - broadcast\n", kv.me, clientId, messageId, op, key, value)
+			if clientCh, ok := kv.clientCh[commandIndex]; ok {
+				DPrintf(
+					"[%v][%d][%d] %v (%v, %v) - broadcast\n",
+					kv.me, clientId, messageId, method, key, value,
+				)
+				clientCh <- command
+			}
 
 			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
 				kv.snapshot(commandIndex)
@@ -138,84 +137,21 @@ func (kv *KVServer) applyRoutine() {
 	}
 }
 
-func (kv *KVServer) Get(
-	args *GetArgs,
-	reply *GetReply,
+func (kv *KVServer) Command(
+	args *CommandArgs,
+	reply *CommandReply,
 ) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	clientId := args.ClientId
-	messageId := args.MessageId
-	key := args.Key
-	command := Op{
-		ClientId:  clientId,
-		MessageId: messageId,
-		Key:       key,
-		Op:        "Get",
-	}
-
-	if messageId < kv.client[clientId] {
-		reply.Err = ErrWrongLeader
-		return
-	}
-
-	index, _, isLeader := kv.rf.Start(command)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
-	DPrintf("[%d][%d][%d] Get %v - started\n", kv.me, clientId, messageId, key)
-
-	timeout := time.Now().Add(500 * time.Millisecond)
-	for kv.appliedId[index] == 0 {
-		kv.cond.Wait()
-		if time.Now().After(timeout) {
-			reply.Err = ErrWrongLeader
-			DPrintf("[%d][%d][%d] Get %v - timeout\n", kv.me, clientId, messageId, key)
-			return
-		}
-	}
-
-	if kv.appliedId[index] != messageId {
-		reply.Err = ErrWrongLeader
-		return
-	}
-
-	value, ok := kv.state[key]
-	if ok {
-		reply.Value = value
-		reply.Err = OK
-	} else {
-		reply.Value = ""
-		reply.Err = ErrNoKey
-	}
-	DPrintf("[%d][%d][%d] Get %v = %v - applied\n", kv.me, clientId, messageId, key, value)
-}
-
-func (kv *KVServer) PutAppend(
-	args *PutAppendArgs,
-	reply *PutAppendReply,
-) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	clientId := args.ClientId
 	messageId := args.MessageId
 	key := args.Key
 	value := args.Value
-	op := args.Op
-	command := Op{
+	method := args.Method
+	command := Command{
 		ClientId:  clientId,
 		MessageId: messageId,
 		Key:       key,
 		Value:     value,
-		Op:        op,
-	}
-
-	if messageId < kv.client[clientId] {
-		reply.Err = ErrWrongLeader
-		return
+		Method:    method,
 	}
 
 	index, _, isLeader := kv.rf.Start(command)
@@ -224,25 +160,51 @@ func (kv *KVServer) PutAppend(
 		return
 	}
 
-	DPrintf("[%d][%d][%d] %v (%v, %v) - started\n", kv.me, clientId, messageId, op, key, value)
+	kv.mu.Lock()
+	DPrintf(
+		"[%v][%d][%d] %v (%v, %v) - start\n",
+		kv.me, clientId, messageId, method, key, value,
+	)
+	kv.clientCh[index] = make(chan Command, 1)
+	clientCh := kv.clientCh[index]
+	kv.mu.Unlock()
 
-	timeout := time.Now().Add(500 * time.Millisecond)
-	for kv.appliedId[index] == 0 {
-		kv.cond.Wait()
-		if time.Now().After(timeout) {
+	select {
+	case appliedCommand := <-clientCh:
+		DPrintf(
+			"[%v][%d][%d] %v (%v, %v) - applied\n",
+			kv.me, clientId, messageId, method, key, value,
+		)
+		kv.mu.Lock()
+		if method == "Get" {
+			reply.Value = kv.state[key]
+		}
+		kv.mu.Unlock()
+
+		appliedClientId := appliedCommand.ClientId
+		appliedMessageId := appliedCommand.MessageId
+		if clientId != appliedClientId || messageId != appliedMessageId {
+			DPrintf(
+				"[%v][%d][%d] %v (%v, %v) - stale\n",
+				kv.me, clientId, messageId, method, key, value,
+			)
 			reply.Err = ErrWrongLeader
-			DPrintf("[%d][%d][%d] %v (%v, %v) - timeout\n", kv.me, clientId, messageId, op, key, value)
 			return
 		}
+	case <-time.After(500 * time.Millisecond):
+		reply.Err = ErrTimeout
+		DPrintf(
+			"[%v][%d][%d] %v (%v, %v) - timeout\n",
+			kv.me, clientId, messageId, method, key, value,
+		)
 	}
 
-	if kv.appliedId[index] != messageId {
-		reply.Err = ErrWrongLeader
-		return
-	}
-
-	DPrintf("[%d][%d][%d] %v (%v, %v) - applied\n", kv.me, clientId, messageId, op, key, value)
-	reply.Err = OK
+	go func() {
+		kv.mu.Lock()
+		close(clientCh)
+		delete(kv.clientCh, index)
+		kv.mu.Unlock()
+	}()
 }
 
 //
@@ -258,7 +220,6 @@ func (kv *KVServer) PutAppend(
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
 }
 
 func (kv *KVServer) killed() bool {
@@ -286,9 +247,7 @@ func StartKVServer(
 	persister *raft.Persister,
 	maxraftstate int,
 ) *KVServer {
-	// call labgob.Register on structures you want
-	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
+	labgob.Register(Command{})
 	labgob.Register(Snapshot{})
 
 	kv := new(KVServer)
@@ -297,15 +256,14 @@ func StartKVServer(
 
 	kv.state = make(map[string]string)
 	kv.client = make(map[int64]int)
-	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.appliedId = make(map[int]int)
-	kv.cond = sync.NewCond(&kv.mu)
-	kv.persister = persister
+	kv.clientCh = make(map[int]chan Command)
 
+	kv.persister = persister
 	kv.readPersist(kv.persister.ReadSnapshot())
+
+	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	go kv.applyRoutine()
-	go kv.broadcastRoutine()
 	return kv
 }
