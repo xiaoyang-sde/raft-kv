@@ -18,7 +18,9 @@ func nrand() int64 {
 	return x
 }
 
-func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
+func MakeClerk(
+	servers []*labrpc.ClientEnd,
+) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	ck.clientId = nrand()
@@ -27,13 +29,13 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 }
 
 func (ck *Clerk) Command(
-	args *CommandArgs,
+	args CommandArgs,
 ) Config {
 	for {
 		for _, server := range ck.servers {
 			reply := &CommandReply{}
-			ok := server.Call("ShardCtrler.Command", args, &reply)
-			if ok && !reply.WrongLeader {
+			ok := server.Call("ShardCtrler.Command", &args, &reply)
+			if ok && reply.Err == OK {
 				ck.messageId += 1
 				return reply.Config
 			}
@@ -45,7 +47,7 @@ func (ck *Clerk) Command(
 func (ck *Clerk) Query(
 	num int,
 ) Config {
-	args := &CommandArgs{}
+	args := CommandArgs{}
 	args.Method = "Query"
 	args.ClientId = ck.clientId
 	args.MessageId = ck.messageId
@@ -56,7 +58,7 @@ func (ck *Clerk) Query(
 func (ck *Clerk) Join(
 	servers map[int][]string,
 ) {
-	args := &CommandArgs{}
+	args := CommandArgs{}
 	args.Method = "Join"
 	args.ClientId = ck.clientId
 	args.MessageId = ck.messageId
@@ -67,7 +69,7 @@ func (ck *Clerk) Join(
 func (ck *Clerk) Leave(
 	gids []int,
 ) {
-	args := &CommandArgs{}
+	args := CommandArgs{}
 	args.Method = "Leave"
 	args.ClientId = ck.clientId
 	args.MessageId = ck.messageId
@@ -76,7 +78,7 @@ func (ck *Clerk) Leave(
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
-	args := &CommandArgs{}
+	args := CommandArgs{}
 	args.Method = "Move"
 	args.ClientId = ck.clientId
 	args.MessageId = ck.messageId
