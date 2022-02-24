@@ -31,3 +31,12 @@ type CommandReply struct {
 	Err   Err
 	Value string
 }
+
+type RequestShardArgs struct {
+	Shard int
+}
+
+type RequestShardReply struct {
+	Err   Err
+	State map[string]string
+}

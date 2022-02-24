@@ -38,16 +38,22 @@ type ShardKV struct {
 	config   shardctrler.Config
 	state    map[string]string
 	client   map[int64]int
-	clientCh map[int]chan CommandArgs
+	clientCh map[int]chan Command
+}
+
+type Command struct {
+	ClientId  int64
+	MessageId int
+	Key       string
+	Value     string
+	Method    string
+	Config    shardctrler.Config
 }
 
 type Snapshot struct {
 	State  map[string]string
 	Client map[int64]int
-}
-
-func (kv *ShardKV) GetConfig() {
-	kv.config = kv.clerk.Query(-1)
+	Config shardctrler.Config
 }
 
 func (kv *ShardKV) snapshot(
@@ -56,6 +62,7 @@ func (kv *ShardKV) snapshot(
 	snapshot := Snapshot{
 		State:  kv.state,
 		Client: kv.client,
+		Config: kv.config,
 	}
 
 	writer := new(bytes.Buffer)
@@ -81,8 +88,35 @@ func (kv *ShardKV) readPersist(
 	if err := decoder.Decode(&decodeSnapshot); err == nil {
 		kv.state = decodeSnapshot.State
 		kv.client = decodeSnapshot.Client
+		kv.config = decodeSnapshot.Config
 	} else {
 		panic(err)
+	}
+}
+
+func (kv *ShardKV) configurationRoutine() {
+	for !kv.killed() {
+		kv.mu.Lock()
+		config := kv.clerk.Query(-1)
+		num := config.Num
+		command := Command{
+			ClientId:  int64(kv.me),
+			MessageId: num,
+			Config:    config,
+			Method:    "Config",
+		}
+		kv.mu.Unlock()
+
+		if num > kv.config.Num {
+			_, _, isLeader := kv.rf.Start(command)
+			if isLeader {
+				DPrintf(
+					"[Group %d][Instance %d][Client %d][Message %d] Config %+v - start\n",
+					kv.gid, kv.me, kv.me, num, config,
+				)
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -93,7 +127,7 @@ func (kv *ShardKV) applyRoutine() {
 
 		commandValid := applyMsg.CommandValid
 		if commandValid {
-			command := applyMsg.Command.(CommandArgs)
+			command := applyMsg.Command.(Command)
 			commandIndex := applyMsg.CommandIndex
 
 			messageId := command.MessageId
@@ -101,6 +135,7 @@ func (kv *ShardKV) applyRoutine() {
 			method := command.Method
 			key := command.Key
 			value := command.Value
+			config := command.Config
 
 			if kv.client[clientId] < messageId {
 				switch method {
@@ -108,14 +143,16 @@ func (kv *ShardKV) applyRoutine() {
 					kv.state[key] = value
 				case "Append":
 					kv.state[key] += value
+				case "Config":
+					kv.switchConfiguration(config)
 				}
 				kv.client[clientId] = messageId
 			}
 
 			if clientCh, ok := kv.clientCh[commandIndex]; ok {
 				DPrintf(
-					"[%v][%d][%d] %v (%v, %v) - broadcast\n",
-					kv.me, clientId, messageId, method, key, value,
+					"[Group %d][Instance %d][Client %d][Message %d] %v (%v, %v) - broadcast\n",
+					kv.gid, kv.me, clientId, messageId, method, key, value,
 				)
 				clientCh <- command
 			}
@@ -139,6 +176,65 @@ func (kv *ShardKV) applyRoutine() {
 	}
 }
 
+func (kv *ShardKV) switchConfiguration(
+	config shardctrler.Config,
+) {
+	num := config.Num
+	for shard, gid := range config.Shards {
+		targetGid := kv.config.Shards[shard]
+		if gid == kv.gid && targetGid != kv.gid && targetGid != 0 {
+			DPrintf(
+				"[Group %d][Instance %d][Client %d][Message %d] RequestShard %d from %d\n",
+				kv.gid, kv.me, kv.me, num, shard, targetGid,
+			)
+
+			args := RequestShardArgs{
+				Shard: shard,
+			}
+			reply := RequestShardReply{}
+			servers, ok := kv.config.Groups[targetGid]
+			if !ok {
+				continue
+			}
+
+			for index := 0; index < len(servers); index++ {
+				server := kv.make_end(servers[index])
+				ok := server.Call("ShardKV.RequestShard", &args, &reply)
+				if ok && reply.Err == OK {
+					for k, v := range reply.State {
+						kv.state[k] = v
+					}
+					break
+				}
+			}
+		}
+	}
+
+	kv.config = config
+}
+
+func (kv *ShardKV) RequestShard(
+	args *RequestShardArgs,
+	reply *RequestShardReply,
+) {
+	kv.mu.Lock()
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+	}
+
+	shard := args.Shard
+	state := make(map[string]string)
+	for k, v := range kv.state {
+		if key2shard(k) == shard {
+			state[k] = v
+		}
+	}
+	reply.State = state
+	reply.Err = OK
+	kv.mu.Unlock()
+}
+
 func (kv *ShardKV) Command(
 	args *CommandArgs,
 	reply *CommandReply,
@@ -149,7 +245,21 @@ func (kv *ShardKV) Command(
 	value := args.Value
 	method := args.Method
 
-	index, _, isLeader := kv.rf.Start(*args)
+	shard := key2shard(key)
+	if kv.config.Shards[shard] != kv.gid {
+		reply.Err = ErrWrongGroup
+		return
+	}
+
+	command := Command{
+		ClientId:  clientId,
+		MessageId: messageId,
+		Key:       key,
+		Value:     value,
+		Method:    method,
+	}
+
+	index, _, isLeader := kv.rf.Start(command)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
@@ -157,17 +267,17 @@ func (kv *ShardKV) Command(
 
 	kv.mu.Lock()
 	DPrintf(
-		"[%d][%d][%d][%d] %v (%v, %v) - start\n",
+		"[Group %d][Instance %d][Client %d][Message %d] %v (%v, %v) - start\n",
 		kv.gid, kv.me, clientId, messageId, method, key, value,
 	)
-	kv.clientCh[index] = make(chan CommandArgs, 1)
+	kv.clientCh[index] = make(chan Command, 1)
 	clientCh := kv.clientCh[index]
 	kv.mu.Unlock()
 
 	select {
 	case appliedCommand := <-clientCh:
 		DPrintf(
-			"[%d][%d][%d][%d] %v (%v, %v) - applied\n",
+			"[Group %d][Instance %d][Client %d][Message %d] %v (%v, %v) - applied\n",
 			kv.gid, kv.me, clientId, messageId, method, key, value,
 		)
 		kv.mu.Lock()
@@ -180,8 +290,8 @@ func (kv *ShardKV) Command(
 		appliedMessageId := appliedCommand.MessageId
 		if clientId != appliedClientId || messageId != appliedMessageId {
 			DPrintf(
-				"[%v][%d][%d] %v (%v, %v) - stale\n",
-				kv.me, clientId, messageId, method, key, value,
+				"[Group %d][Instance %d][Client %d][Message %d] %v (%v, %v) - stale\n",
+				kv.gid, kv.me, clientId, messageId, method, key, value,
 			)
 			reply.Err = ErrWrongLeader
 			return
@@ -190,8 +300,8 @@ func (kv *ShardKV) Command(
 	case <-time.After(500 * time.Millisecond):
 		reply.Err = ErrTimeout
 		DPrintf(
-			"[%v][%d][%d] %v (%v, %v) - timeout\n",
-			kv.me, clientId, messageId, method, key, value,
+			"[Group %d][Instance %d][Client %d][Message %d] %v (%v, %v) - timeout\n",
+			kv.gid, kv.me, clientId, messageId, method, key, value,
 		)
 	}
 
@@ -256,7 +366,7 @@ func StartServer(
 	ctrlers []*labrpc.ClientEnd,
 	make_end func(string) *labrpc.ClientEnd,
 ) *ShardKV {
-	labgob.Register(CommandArgs{})
+	labgob.Register(Command{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -269,7 +379,7 @@ func StartServer(
 
 	kv.state = make(map[string]string)
 	kv.client = make(map[int64]int)
-	kv.clientCh = make(map[int]chan CommandArgs)
+	kv.clientCh = make(map[int]chan Command)
 
 	kv.persister = persister
 	kv.readPersist(kv.persister.ReadSnapshot())
@@ -277,8 +387,7 @@ func StartServer(
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	kv.GetConfig()
-	DPrintf("%+v\n", kv.config)
+	go kv.configurationRoutine()
 	go kv.applyRoutine()
 	return kv
 }

@@ -12,7 +12,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -108,7 +108,9 @@ func (sc *ShardCtrler) applyRoutine() {
 			}
 
 			if clientCh, ok := sc.clientCh[commandIndex]; ok {
-				DPrintf("[Controller][%d] %+v - broadcast\n", sc.me, command)
+				if method != "Query" {
+					DPrintf("[Controller][%d] %+v - broadcast\n", sc.me, command)
+				}
 				clientCh <- command
 			}
 		}
@@ -130,7 +132,9 @@ func (sc *ShardCtrler) Command(
 		reply.WrongLeader = true
 		return
 	}
-	DPrintf("[Controller][%d] %+v - start\n", sc.me, args)
+	if args.Method != "Query" {
+		DPrintf("[Controller][%d] %+v - start\n", sc.me, args)
+	}
 
 	sc.mu.Lock()
 	sc.clientCh[index] = make(chan CommandArgs, 1)
@@ -146,7 +150,9 @@ func (sc *ShardCtrler) Command(
 			return
 		}
 
-		DPrintf("[Controller][%d] %+v - applied\n", sc.me, args)
+		if args.Method != "Query" {
+			DPrintf("[Controller][%d] %+v - applied\n", sc.me, args)
+		}
 		sc.mu.Lock()
 		if queryNum == -1 || queryNum >= len(sc.configs) {
 			reply.Config = sc.configs[len(sc.configs)-1]
@@ -155,7 +161,9 @@ func (sc *ShardCtrler) Command(
 		}
 		sc.mu.Unlock()
 	case <-time.After(500 * time.Millisecond):
-		DPrintf("[Controller][%d] %+v - timeout\n", sc.me, args)
+		if args.Method != "Query" {
+			DPrintf("[Controller][%d] %+v - timeout\n", sc.me, args)
+		}
 		reply.Err = ErrTimeout
 	}
 
