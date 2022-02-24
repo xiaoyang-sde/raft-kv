@@ -14,7 +14,10 @@ import (
 
 const Debug = false
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
+func DPrintf(
+	format string,
+	a ...interface{},
+) (n int, err error) {
 	if Debug {
 		log.Printf(format, a...)
 	}
@@ -59,10 +62,12 @@ func (kv *KVServer) snapshot(
 	writer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(writer)
 	encoder.Encode(snapshot)
+
 	DPrintf(
 		"[%d] %d - snapshot\n",
 		kv.me, index,
 	)
+
 	kv.rf.Snapshot(index, writer.Bytes())
 }
 
@@ -112,7 +117,7 @@ func (kv *KVServer) applyRoutine() {
 
 			if clientCh, ok := kv.clientCh[commandIndex]; ok {
 				DPrintf(
-					"[%v][%d][%d] %v (%v, %v) - broadcast\n",
+					"[%d][%d][%d] %v (%v, %v) - broadcast\n",
 					kv.me, clientId, messageId, method, key, value,
 				)
 				clientCh <- command
@@ -162,7 +167,7 @@ func (kv *KVServer) Command(
 
 	kv.mu.Lock()
 	DPrintf(
-		"[%v][%d][%d] %v (%v, %v) - start\n",
+		"[%d][%d][%d] %v (%v, %v) - start\n",
 		kv.me, clientId, messageId, method, key, value,
 	)
 	kv.clientCh[index] = make(chan Command, 1)
@@ -172,25 +177,26 @@ func (kv *KVServer) Command(
 	select {
 	case appliedCommand := <-clientCh:
 		DPrintf(
-			"[%v][%d][%d] %v (%v, %v) - applied\n",
+			"[%d][%d][%d] %v (%v, %v) - applied\n",
 			kv.me, clientId, messageId, method, key, value,
 		)
-		kv.mu.Lock()
+		kv.mu.RLock()
 		if method == "Get" {
 			reply.Value = kv.state[key]
 		}
-		kv.mu.Unlock()
+		kv.mu.RUnlock()
 
 		appliedClientId := appliedCommand.ClientId
 		appliedMessageId := appliedCommand.MessageId
 		if clientId != appliedClientId || messageId != appliedMessageId {
 			DPrintf(
-				"[%v][%d][%d] %v (%v, %v) - stale\n",
+				"[%d][%d][%d] %v (%v, %v) - stale\n",
 				kv.me, clientId, messageId, method, key, value,
 			)
 			reply.Err = ErrWrongLeader
 			return
 		}
+		reply.Err = OK
 	case <-time.After(500 * time.Millisecond):
 		reply.Err = ErrTimeout
 		DPrintf(

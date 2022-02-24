@@ -1,8 +1,10 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"6.824/labrpc"
+	"crypto/rand"
+	"math/big"
+)
 
 type Clerk struct {
 	servers   []*labrpc.ClientEnd
@@ -18,7 +20,9 @@ func nrand() int64 {
 	return x
 }
 
-func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
+func MakeClerk(
+	servers []*labrpc.ClientEnd,
+) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	ck.leader = 0
@@ -47,12 +51,12 @@ func (ck *Clerk) Command(
 		err := reply.Err
 		value := reply.Value
 
-		if !ok || err == ErrWrongLeader || err == ErrTimeout {
-			index += 1
-		} else {
+		if ok && err == OK {
 			ck.leader = index % len(ck.servers)
 			ck.messageId += 1
 			return value
+		} else {
+			index += 1
 		}
 	}
 }
@@ -69,6 +73,7 @@ func (ck *Clerk) Put(
 ) {
 	ck.Command(key, value, "Put")
 }
+
 func (ck *Clerk) Append(
 	key string,
 	value string,
