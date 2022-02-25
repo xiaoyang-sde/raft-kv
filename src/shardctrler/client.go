@@ -28,16 +28,16 @@ func MakeClerk(
 	return ck
 }
 
-func (ck *Clerk) Command(
-	args CommandArgs,
+func (ck *Clerk) Operation(
+	request OperationRequest,
 ) Config {
 	for {
 		for _, server := range ck.servers {
-			reply := &CommandReply{}
-			ok := server.Call("ShardCtrler.Command", &args, &reply)
-			if ok && reply.Err == OK {
+			response := OperationResponse{}
+			ok := server.Call("ShardCtrler.Operation", &request, &response)
+			if ok && response.Err == OK {
 				ck.messageId += 1
-				return reply.Config
+				return response.Config
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -47,42 +47,49 @@ func (ck *Clerk) Command(
 func (ck *Clerk) Query(
 	num int,
 ) Config {
-	args := CommandArgs{}
-	args.Method = "Query"
-	args.ClientId = ck.clientId
-	args.MessageId = ck.messageId
-	args.QueryNum = num
-	return ck.Command(args)
+	request := OperationRequest{
+		ClientId:  ck.clientId,
+		MessageId: ck.messageId,
+		Method:    "Query",
+		QueryNum:  num,
+	}
+	return ck.Operation(request)
 }
 
 func (ck *Clerk) Join(
 	servers map[int][]string,
 ) {
-	args := CommandArgs{}
-	args.Method = "Join"
-	args.ClientId = ck.clientId
-	args.MessageId = ck.messageId
-	args.JoinServers = servers
-	ck.Command(args)
+	request := OperationRequest{
+		ClientId:    ck.clientId,
+		MessageId:   ck.messageId,
+		Method:      "Join",
+		JoinServers: servers,
+	}
+	ck.Operation(request)
 }
 
 func (ck *Clerk) Leave(
 	gids []int,
 ) {
-	args := CommandArgs{}
-	args.Method = "Leave"
-	args.ClientId = ck.clientId
-	args.MessageId = ck.messageId
-	args.LeaveGIDs = gids
-	ck.Command(args)
+	request := OperationRequest{
+		ClientId:  ck.clientId,
+		MessageId: ck.messageId,
+		Method:    "Leave",
+		LeaveGIDs: gids,
+	}
+	ck.Operation(request)
 }
 
-func (ck *Clerk) Move(shard int, gid int) {
-	args := CommandArgs{}
-	args.Method = "Move"
-	args.ClientId = ck.clientId
-	args.MessageId = ck.messageId
-	args.MoveShard = shard
-	args.MoveGID = gid
-	ck.Command(args)
+func (ck *Clerk) Move(
+	shard int,
+	gid int,
+) {
+	request := OperationRequest{
+		ClientId:  ck.clientId,
+		MessageId: ck.messageId,
+		Method:    "Move",
+		MoveShard: shard,
+		MoveGID:   gid,
+	}
+	ck.Operation(request)
 }

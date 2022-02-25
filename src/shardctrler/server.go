@@ -30,11 +30,11 @@ type ShardCtrler struct {
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
 
-	dead      int32
-	persister *raft.Persister
-	client    map[int64]int
-	clientCh  map[int]chan CommandArgs
-	configs   []Config
+	dead        int32
+	persister   *raft.Persister
+	client      map[int64]int
+	broadcastCh map[int]chan OperationRequest
+	configs     []Config
 }
 
 func (sc *ShardCtrler) applyRoutine() {
@@ -44,7 +44,7 @@ func (sc *ShardCtrler) applyRoutine() {
 
 		commandValid := applyMsg.CommandValid
 		if commandValid {
-			command := applyMsg.Command.(CommandArgs)
+			command := applyMsg.Command.(OperationRequest)
 			commandIndex := applyMsg.CommandIndex
 
 			messageId := command.MessageId
@@ -110,8 +110,8 @@ func (sc *ShardCtrler) applyRoutine() {
 				sc.client[clientId] = messageId
 			}
 
-			if clientCh, ok := sc.clientCh[commandIndex]; ok {
-				clientCh <- command
+			if broadcastCh, ok := sc.broadcastCh[commandIndex]; ok {
+				broadcastCh <- command
 			}
 		}
 
@@ -119,51 +119,51 @@ func (sc *ShardCtrler) applyRoutine() {
 	}
 }
 
-func (sc *ShardCtrler) Command(
-	args *CommandArgs,
-	reply *CommandReply,
+func (sc *ShardCtrler) Operation(
+	request *OperationRequest,
+	response *OperationResponse,
 ) {
-	clientId := args.ClientId
-	messageId := args.MessageId
-	queryNum := args.QueryNum
+	clientId := request.ClientId
+	messageId := request.MessageId
+	queryNum := request.QueryNum
 
-	index, _, isLeader := sc.rf.Start(*args)
+	index, _, isLeader := sc.rf.Start(*request)
 	if !isLeader {
-		reply.WrongLeader = true
+		response.WrongLeader = true
 		return
 	}
 
 	sc.mu.Lock()
-	sc.clientCh[index] = make(chan CommandArgs, 1)
-	clientCh := sc.clientCh[index]
+	sc.broadcastCh[index] = make(chan OperationRequest, 1)
+	broadcastCh := sc.broadcastCh[index]
 	sc.mu.Unlock()
 
 	select {
-	case appliedCommand := <-clientCh:
+	case appliedCommand := <-broadcastCh:
 		appliedClientId := appliedCommand.ClientId
 		appliedMessageId := appliedCommand.MessageId
 		if clientId != appliedClientId || messageId != appliedMessageId {
-			reply.WrongLeader = true
+			response.WrongLeader = true
 			return
 		}
 
 		sc.mu.RLock()
 		if queryNum == -1 || queryNum >= len(sc.configs) {
-			reply.Config = sc.configs[len(sc.configs)-1]
+			response.Config = sc.configs[len(sc.configs)-1]
 		} else {
-			reply.Config = sc.configs[queryNum]
+			response.Config = sc.configs[queryNum]
 		}
 		sc.mu.RUnlock()
 
-		reply.Err = OK
+		response.Err = OK
 	case <-time.After(500 * time.Millisecond):
-		reply.Err = ErrTimeout
+		response.Err = ErrTimeout
 	}
 
 	go func() {
 		sc.mu.Lock()
-		close(clientCh)
-		delete(sc.clientCh, index)
+		close(broadcastCh)
+		delete(sc.broadcastCh, index)
 		sc.mu.Unlock()
 	}()
 }
@@ -210,12 +210,12 @@ func StartServer(
 		sc.configs[0].Shards[i] = 0
 	}
 
-	labgob.Register(CommandArgs{})
+	labgob.Register(OperationRequest{})
 	sc.applyCh = make(chan raft.ApplyMsg)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
 
 	sc.client = make(map[int64]int)
-	sc.clientCh = make(map[int]chan CommandArgs)
+	sc.broadcastCh = make(map[int]chan OperationRequest)
 
 	go sc.applyRoutine()
 	return sc

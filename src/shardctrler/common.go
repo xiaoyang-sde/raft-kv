@@ -15,7 +15,7 @@ const (
 
 type Err string
 
-type CommandArgs struct {
+type OperationRequest struct {
 	ClientId    int64
 	MessageId   int
 	Method      string
@@ -26,7 +26,7 @@ type CommandArgs struct {
 	QueryNum    int
 }
 
-type CommandReply struct {
+type OperationResponse struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
