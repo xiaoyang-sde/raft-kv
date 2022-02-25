@@ -40,6 +40,16 @@ type PullShardArgs struct {
 
 type PullShardReply struct {
 	Err    Err
+	Num    int
 	State  map[int]Shard
 	Client map[int64]int
+}
+
+type DeleteShardArgs struct {
+	Num       int
+	ShardList []int
+}
+
+type DeleteShardReply struct {
+	Err Err
 }
