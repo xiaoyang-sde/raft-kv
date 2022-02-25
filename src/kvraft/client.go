@@ -31,25 +31,25 @@ func MakeClerk(
 	return ck
 }
 
-func (ck *Clerk) Command(
+func (ck *Clerk) Operation(
 	key string,
 	value string,
 	method string,
 ) string {
 	index := ck.leader
 	for {
-		args := CommandArgs{
+		request := OperationRequest{
 			ClientId:  ck.clientId,
 			MessageId: ck.messageId,
 			Method:    method,
 			Key:       key,
 			Value:     value,
 		}
-		reply := CommandReply{}
+		response := OperationResponse{}
 
-		ok := ck.servers[index%len(ck.servers)].Call("KVServer.Command", &args, &reply)
-		err := reply.Err
-		value := reply.Value
+		ok := ck.servers[index%len(ck.servers)].Call("KVServer.Operation", &request, &response)
+		err := response.Err
+		value := response.Value
 
 		if ok && err == OK {
 			ck.leader = index % len(ck.servers)
@@ -64,19 +64,19 @@ func (ck *Clerk) Command(
 func (ck *Clerk) Get(
 	key string,
 ) string {
-	return ck.Command(key, "", "Get")
+	return ck.Operation(key, "", "Get")
 }
 
 func (ck *Clerk) Put(
 	key string,
 	value string,
 ) {
-	ck.Command(key, value, "Put")
+	ck.Operation(key, value, "Put")
 }
 
 func (ck *Clerk) Append(
 	key string,
 	value string,
 ) {
-	ck.Command(key, value, "Append")
+	ck.Operation(key, value, "Append")
 }

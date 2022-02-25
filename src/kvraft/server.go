@@ -24,7 +24,21 @@ func DPrintf(
 	return
 }
 
-type Command struct {
+type KVServer struct {
+	mu           sync.RWMutex
+	me           int
+	rf           *raft.Raft
+	applyCh      chan raft.ApplyMsg
+	dead         int32 // set by Kill()
+	maxraftstate int   // snapshot if log grows this big
+	persister    *raft.Persister
+
+	state       map[string]string
+	client      map[int64]int
+	broadcastCh map[int]chan Operation
+}
+
+type Operation struct {
 	ClientId  int64
 	MessageId int
 	Key       string
@@ -35,20 +49,6 @@ type Command struct {
 type Snapshot struct {
 	State  map[string]string
 	Client map[int64]int
-}
-
-type KVServer struct {
-	mu           sync.RWMutex
-	me           int
-	rf           *raft.Raft
-	applyCh      chan raft.ApplyMsg
-	dead         int32 // set by Kill()
-	maxraftstate int   // snapshot if log grows this big
-	persister    *raft.Persister
-
-	state    map[string]string
-	client   map[int64]int
-	clientCh map[int]chan Command
 }
 
 func (kv *KVServer) snapshot(
@@ -62,11 +62,6 @@ func (kv *KVServer) snapshot(
 	writer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(writer)
 	encoder.Encode(snapshot)
-
-	DPrintf(
-		"[%d] %d - snapshot\n",
-		kv.me, index,
-	)
 
 	kv.rf.Snapshot(index, writer.Bytes())
 }
@@ -96,7 +91,7 @@ func (kv *KVServer) applyRoutine() {
 
 		commandValid := applyMsg.CommandValid
 		if commandValid {
-			command := applyMsg.Command.(Command)
+			command := applyMsg.Command.(Operation)
 			commandIndex := applyMsg.CommandIndex
 
 			messageId := command.MessageId
@@ -115,12 +110,8 @@ func (kv *KVServer) applyRoutine() {
 				kv.client[clientId] = messageId
 			}
 
-			if clientCh, ok := kv.clientCh[commandIndex]; ok {
-				DPrintf(
-					"[%d][%d][%d] %v (%v, %v) - broadcast\n",
-					kv.me, clientId, messageId, method, key, value,
-				)
-				clientCh <- command
+			if broadcastCh, ok := kv.broadcastCh[commandIndex]; ok {
+				broadcastCh <- command
 			}
 
 			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
@@ -142,16 +133,16 @@ func (kv *KVServer) applyRoutine() {
 	}
 }
 
-func (kv *KVServer) Command(
-	args *CommandArgs,
-	reply *CommandReply,
+func (kv *KVServer) Operation(
+	request *OperationRequest,
+	response *OperationResponse,
 ) {
-	clientId := args.ClientId
-	messageId := args.MessageId
-	key := args.Key
-	value := args.Value
-	method := args.Method
-	command := Command{
+	clientId := request.ClientId
+	messageId := request.MessageId
+	key := request.Key
+	value := request.Value
+	method := request.Method
+	command := Operation{
 		ClientId:  clientId,
 		MessageId: messageId,
 		Key:       key,
@@ -161,54 +152,38 @@ func (kv *KVServer) Command(
 
 	index, _, isLeader := kv.rf.Start(command)
 	if !isLeader {
-		reply.Err = ErrWrongLeader
+		response.Err = ErrWrongLeader
 		return
 	}
 
 	kv.mu.Lock()
-	DPrintf(
-		"[%d][%d][%d] %v (%v, %v) - start\n",
-		kv.me, clientId, messageId, method, key, value,
-	)
-	kv.clientCh[index] = make(chan Command, 1)
-	clientCh := kv.clientCh[index]
+	kv.broadcastCh[index] = make(chan Operation, 1)
+	broadcastCh := kv.broadcastCh[index]
 	kv.mu.Unlock()
 
 	select {
-	case appliedCommand := <-clientCh:
-		DPrintf(
-			"[%d][%d][%d] %v (%v, %v) - applied\n",
-			kv.me, clientId, messageId, method, key, value,
-		)
+	case appliedCommand := <-broadcastCh:
 		kv.mu.RLock()
 		if method == "Get" {
-			reply.Value = kv.state[key]
+			response.Value = kv.state[key]
 		}
 		kv.mu.RUnlock()
 
 		appliedClientId := appliedCommand.ClientId
 		appliedMessageId := appliedCommand.MessageId
 		if clientId != appliedClientId || messageId != appliedMessageId {
-			DPrintf(
-				"[%d][%d][%d] %v (%v, %v) - stale\n",
-				kv.me, clientId, messageId, method, key, value,
-			)
-			reply.Err = ErrWrongLeader
+			response.Err = ErrWrongLeader
 			return
 		}
-		reply.Err = OK
+		response.Err = OK
 	case <-time.After(500 * time.Millisecond):
-		reply.Err = ErrTimeout
-		DPrintf(
-			"[%v][%d][%d] %v (%v, %v) - timeout\n",
-			kv.me, clientId, messageId, method, key, value,
-		)
+		response.Err = ErrTimeout
 	}
 
 	go func() {
 		kv.mu.Lock()
-		close(clientCh)
-		delete(kv.clientCh, index)
+		close(broadcastCh)
+		delete(kv.broadcastCh, index)
 		kv.mu.Unlock()
 	}()
 }
@@ -253,7 +228,7 @@ func StartKVServer(
 	persister *raft.Persister,
 	maxraftstate int,
 ) *KVServer {
-	labgob.Register(Command{})
+	labgob.Register(Operation{})
 	labgob.Register(Snapshot{})
 
 	kv := new(KVServer)
@@ -262,7 +237,7 @@ func StartKVServer(
 
 	kv.state = make(map[string]string)
 	kv.client = make(map[int64]int)
-	kv.clientCh = make(map[int]chan Command)
+	kv.broadcastCh = make(map[int]chan Operation)
 
 	kv.persister = persister
 	kv.readPersist(kv.persister.ReadSnapshot())

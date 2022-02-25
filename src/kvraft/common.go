@@ -8,7 +8,7 @@ const (
 
 type Err string
 
-type CommandArgs struct {
+type OperationRequest struct {
 	ClientId  int64
 	MessageId int
 	Key       string
@@ -16,7 +16,7 @@ type CommandArgs struct {
 	Method    string
 }
 
-type CommandReply struct {
+type OperationResponse struct {
 	Err   Err
 	Value string
 }
