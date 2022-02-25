@@ -80,7 +80,7 @@ func (ck *Clerk) Command(
 					ck.messageId += 1
 					return reply.Value
 				}
-				if ok && (reply.Err == ErrWrongGroup) {
+				if ok && reply.Err == ErrWrongGroup {
 					break
 				}
 			}

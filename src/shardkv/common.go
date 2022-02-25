@@ -15,6 +15,7 @@ const (
 	ErrTimeout     = "ErrTimeout"
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrFuture      = "ErrFuture"
 )
 
 type Err string
@@ -32,11 +33,13 @@ type CommandReply struct {
 	Value string
 }
 
-type RequestShardArgs struct {
-	Shard int
+type PullShardArgs struct {
+	Num       int
+	ShardList []int
 }
 
-type RequestShardReply struct {
-	Err   Err
-	State map[string]string
+type PullShardReply struct {
+	Err    Err
+	State  map[int]Shard
+	Client map[int64]int
 }
