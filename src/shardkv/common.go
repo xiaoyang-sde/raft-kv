@@ -20,7 +20,7 @@ const (
 
 type Err string
 
-type CommandArgs struct {
+type OperationRequest struct {
 	ClientId  int64
 	MessageId int
 	Key       string
@@ -28,28 +28,28 @@ type CommandArgs struct {
 	Method    string
 }
 
-type CommandReply struct {
+type OperationResponse struct {
 	Err   Err
 	Value string
 }
 
-type PullShardArgs struct {
+type PullShardRequest struct {
 	Num       int
 	ShardList []int
 }
 
-type PullShardReply struct {
+type PullShardResponse struct {
 	Err    Err
 	Num    int
 	State  map[int]Shard
 	Client map[int64]int
 }
 
-type DeleteShardArgs struct {
+type DeleteShardRequest struct {
 	Num       int
 	ShardList []int
 }
 
-type DeleteShardReply struct {
+type DeleteShardResponse struct {
 	Err Err
 }

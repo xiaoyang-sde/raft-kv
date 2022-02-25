@@ -40,15 +40,6 @@ type Clerk struct {
 	messageId int
 }
 
-//
-// the tester calls MakeClerk.
-//
-// ctrlers[] is needed to call shardctrler.MakeClerk().
-//
-// make_end(servername) turns a server name from a
-// Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
-// send RPCs.
-//
 func MakeClerk(
 	ctrlers []*labrpc.ClientEnd,
 	make_end func(string) *labrpc.ClientEnd,
@@ -62,25 +53,25 @@ func MakeClerk(
 }
 
 func (ck *Clerk) Command(
-	args CommandArgs,
+	request OperationRequest,
 ) string {
-	args.ClientId = ck.clientId
-	args.MessageId = ck.messageId
-	key := args.Key
+	request.ClientId = ck.clientId
+	request.MessageId = ck.messageId
+	key := request.Key
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for index := 0; index < len(servers); index++ {
 				server := ck.make_end(servers[index])
-				var reply CommandReply
-				ok := server.Call("ShardKV.Command", &args, &reply)
+				response := OperationResponse{}
+				ok := server.Call("ShardKV.Operation", &request, &response)
 
-				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+				if ok && (response.Err == OK || response.Err == ErrNoKey) {
 					ck.messageId += 1
-					return reply.Value
+					return response.Value
 				}
-				if ok && reply.Err == ErrWrongGroup {
+				if ok && response.Err == ErrWrongGroup {
 					break
 				}
 			}
@@ -93,7 +84,7 @@ func (ck *Clerk) Command(
 func (ck *Clerk) Get(
 	key string,
 ) string {
-	args := CommandArgs{
+	args := OperationRequest{
 		Key:    key,
 		Method: "Get",
 	}
@@ -104,7 +95,7 @@ func (ck *Clerk) Put(
 	key string,
 	value string,
 ) {
-	args := CommandArgs{
+	args := OperationRequest{
 		Key:    key,
 		Value:  value,
 		Method: "Put",
@@ -116,7 +107,7 @@ func (ck *Clerk) Append(
 	key string,
 	value string,
 ) {
-	args := CommandArgs{
+	args := OperationRequest{
 		Key:    key,
 		Value:  value,
 		Method: "Append",

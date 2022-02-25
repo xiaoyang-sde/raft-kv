@@ -13,7 +13,7 @@ import (
 	"6.824/shardctrler"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(
 	format string,
@@ -28,24 +28,24 @@ func DPrintf(
 type ShardKV struct {
 	mu           sync.RWMutex
 	me           int
+	gid          int
+	maxRaftState int
+	dead         int32
 	rf           *raft.Raft
 	persister    *raft.Persister
-	maxraftstate int
 	applyCh      chan raft.ApplyMsg
-	dead         int32
-	make_end     func(string) *labrpc.ClientEnd
-	gid          int
 	ctrlers      []*labrpc.ClientEnd
+	makeEnd      func(string) *labrpc.ClientEnd
 
-	clerk      *shardctrler.Clerk
-	state      [shardctrler.NShards]Shard
-	config     shardctrler.Config
-	lastConfig shardctrler.Config
-	client     map[int64]int
-	clientCh   map[int]chan Command
+	clerk       *shardctrler.Clerk
+	state       [shardctrler.NShards]Shard
+	client      map[int64]int
+	broadcastCh map[int]chan interface{}
+	config      shardctrler.Config
+	lastConfig  shardctrler.Config
 }
 
-type Command struct {
+type Operation struct {
 	ClientId  int64
 	MessageId int
 	Key       string
@@ -57,13 +57,13 @@ type Configuration struct {
 	Config shardctrler.Config
 }
 
-type MergeState struct {
+type PullShard struct {
 	State  map[int]Shard
 	Client map[int64]int
 	Num    int
 }
 
-type DeleteState struct {
+type DeleteShard struct {
 	ShardList []int
 	Num       int
 }
@@ -152,7 +152,7 @@ func (kv *ShardKV) readPersist(
 	reader := bytes.NewBuffer(snapshot)
 	decoder := labgob.NewDecoder(reader)
 
-	var decodeSnapshot Snapshot
+	decodeSnapshot := Snapshot{}
 	if err := decoder.Decode(&decodeSnapshot); err == nil {
 		kv.state = decodeSnapshot.State
 		kv.config = decodeSnapshot.Config
@@ -164,43 +164,6 @@ func (kv *ShardKV) readPersist(
 	}
 }
 
-func (kv *ShardKV) configureRoutine() {
-	for !kv.killed() {
-		kv.mu.RLock()
-		defaultShard := true
-		for _, shard := range kv.state {
-			if shard.Status != Default {
-				defaultShard = false
-				break
-			}
-		}
-		currentNum := kv.config.Num
-		kv.mu.RUnlock()
-
-		_, isLeader := kv.rf.GetState()
-		if isLeader && defaultShard {
-			nextConfig := kv.clerk.Query(currentNum + 1)
-			nextNum := nextConfig.Num
-
-			if currentNum+1 == nextNum {
-				command := Configuration{
-					Config: nextConfig,
-				}
-				index, _, isLeader := kv.rf.Start(command)
-				if isLeader {
-					DPrintf(
-						"[Group %d][Instance %d] Configuration %+v - start\n",
-						kv.gid, kv.me, nextConfig,
-					)
-					kv.Consensus(index)
-				}
-			}
-		}
-
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
 func (kv *ShardKV) applyRoutine() {
 	for !kv.killed() {
 		applyMsg := <-kv.applyCh
@@ -209,54 +172,28 @@ func (kv *ShardKV) applyRoutine() {
 		commandValid := applyMsg.CommandValid
 		if commandValid {
 			commandIndex := applyMsg.CommandIndex
-
-			if command, ok := applyMsg.Command.(Command); ok {
-				messageId := command.MessageId
-				clientId := command.ClientId
-				method := command.Method
-				key := command.Key
-				value := command.Value
-				shard := key2shard(key)
-
-				if !kv.staleShard(shard) && kv.client[clientId] < messageId {
-					switch method {
-					case "Put":
-						kv.state[shard].Put(key, value)
-					case "Append":
-						kv.state[shard].Append(key, value)
-					}
-					kv.client[clientId] = messageId
-				}
-
-				if clientCh, ok := kv.clientCh[commandIndex]; ok {
-					clientCh <- command
-				}
+			if command, ok := applyMsg.Command.(Operation); ok {
+				kv.applyOperation(command)
 			}
 
 			if command, ok := applyMsg.Command.(Configuration); ok {
-				config := command.Config
-				kv.applyConfiguration(config)
+				kv.applyConfiguration(command)
 			}
 
-			if command, ok := applyMsg.Command.(MergeState); ok {
-				state := command.State
-				client := command.Client
-				num := command.Num
-				kv.applyMergeState(state, client, num)
+			if command, ok := applyMsg.Command.(PullShard); ok {
+				kv.applyPullShard(command)
 			}
 
-			if command, ok := applyMsg.Command.(DeleteState); ok {
-				shardList := command.ShardList
-				num := command.Num
-				kv.applyDeleteState(shardList, num)
+			if command, ok := applyMsg.Command.(DeleteShard); ok {
+				kv.applyDeleteShard(command)
 			}
 
-			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
+			if broadcastCh, ok := kv.broadcastCh[commandIndex]; ok {
+				broadcastCh <- applyMsg.Command
+			}
+
+			if kv.maxRaftState != -1 && kv.persister.RaftStateSize() > kv.maxRaftState {
 				kv.snapshot(commandIndex)
-			}
-
-			if clientCh, ok := kv.clientCh[commandIndex]; ok {
-				clientCh <- Command{}
 			}
 		}
 
@@ -274,7 +211,40 @@ func (kv *ShardKV) applyRoutine() {
 	}
 }
 
-func (kv *ShardKV) migrationRoutine() {
+func (kv *ShardKV) configurationRoutine() {
+	for !kv.killed() {
+		kv.mu.RLock()
+		defaultShard := true
+		for _, shard := range kv.state {
+			if shard.Status != Default {
+				defaultShard = false
+				break
+			}
+		}
+		num := kv.config.Num
+		kv.mu.RUnlock()
+
+		_, isLeader := kv.rf.GetState()
+		if isLeader && defaultShard {
+			nextConfig := kv.clerk.Query(num + 1)
+			nextNum := nextConfig.Num
+
+			if num+1 == nextNum {
+				command := Configuration{
+					Config: nextConfig,
+				}
+				index, _, isLeader := kv.rf.Start(command)
+				if isLeader {
+					kv.consensus(index)
+				}
+			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) pullShardRoutine() {
 	for !kv.killed() {
 		_, isLeader := kv.rf.GetState()
 		if isLeader {
@@ -300,7 +270,7 @@ func (kv *ShardKV) migrationRoutine() {
 	}
 }
 
-func (kv *ShardKV) collectionRoutine() {
+func (kv *ShardKV) deleteShardRoutine() {
 	for !kv.killed() {
 		_, isLeader := kv.rf.GetState()
 		if isLeader {
@@ -326,9 +296,44 @@ func (kv *ShardKV) collectionRoutine() {
 	}
 }
 
-func (kv *ShardKV) applyConfiguration(
-	nextConfig shardctrler.Config,
+func (kv *ShardKV) heartbeatRoutine() {
+	for !kv.killed() {
+		_, isLeader := kv.rf.GetState()
+		if isLeader {
+			index, _, isLeader := kv.rf.Start(Operation{})
+			if isLeader {
+				kv.consensus(index)
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func (kv *ShardKV) applyOperation(
+	command Operation,
 ) {
+	messageId := command.MessageId
+	clientId := command.ClientId
+	method := command.Method
+	key := command.Key
+	value := command.Value
+	shard := key2shard(key)
+
+	if !kv.staleShard(shard) && kv.client[clientId] < messageId {
+		switch method {
+		case "Put":
+			kv.state[shard].Put(key, value)
+		case "Append":
+			kv.state[shard].Append(key, value)
+		}
+		kv.client[clientId] = messageId
+	}
+}
+
+func (kv *ShardKV) applyConfiguration(
+	command Configuration,
+) {
+	nextConfig := command.Config
 	nextNum := nextConfig.Num
 	if nextNum != kv.config.Num+1 {
 		return
@@ -346,57 +351,15 @@ func (kv *ShardKV) applyConfiguration(
 
 	kv.lastConfig = kv.config
 	kv.config = nextConfig
-
-	DPrintf(
-		"[Group %d][Instance %d] Configuration %+v - applied\n",
-		kv.gid, kv.me, nextConfig,
-	)
-	DPrintf("[Group %d][Instance %d] Shard %+v - applied\n",
-		kv.gid, kv.me, kv.state,
-	)
 }
 
-func (kv *ShardKV) applyDeleteState(
-	shardList []int,
-	num int,
+func (kv *ShardKV) applyPullShard(
+	command PullShard,
 ) {
+	state := command.State
+	client := command.Client
+	num := command.Num
 	if num != kv.config.Num {
-		DPrintf(
-			"[Group %d][Instance %d] DeleteState %+v - stale\n",
-			kv.gid, kv.me, shardList,
-		)
-		return
-	}
-
-	for _, shard := range shardList {
-		if kv.state[shard].Status == Collection {
-			kv.state[shard].Status = Default
-		}
-
-		if kv.state[shard].Status == Push {
-			kv.state[shard] = Shard{
-				Status: Default,
-				State:  make(map[string]string),
-			}
-		}
-	}
-
-	DPrintf(
-		"[Group %d][Instance %d] DeleteState %+v - applied\n",
-		kv.gid, kv.me, shardList,
-	)
-}
-
-func (kv *ShardKV) applyMergeState(
-	state map[int]Shard,
-	client map[int64]int,
-	num int,
-) {
-	if num != kv.config.Num {
-		DPrintf(
-			"[Group %d][Instance %d] MergeState %+v - stale\n",
-			kv.gid, kv.me, state,
-		)
 		return
 	}
 
@@ -414,11 +377,29 @@ func (kv *ShardKV) applyMergeState(
 			kv.client[clientId] = messageId
 		}
 	}
+}
 
-	DPrintf(
-		"[Group %d][Instance %d] MergeState %+v - applied\n",
-		kv.gid, kv.me, state,
-	)
+func (kv *ShardKV) applyDeleteShard(
+	command DeleteShard,
+) {
+	shardList := command.ShardList
+	num := command.Num
+	if num != kv.config.Num {
+		return
+	}
+
+	for _, shard := range shardList {
+		if kv.state[shard].Status == Collection {
+			kv.state[shard].Status = Default
+		}
+
+		if kv.state[shard].Status == Push {
+			kv.state[shard] = Shard{
+				Status: Default,
+				State:  make(map[string]string),
+			}
+		}
+	}
 }
 
 func (kv *ShardKV) sendPullShard(
@@ -427,32 +408,29 @@ func (kv *ShardKV) sendPullShard(
 	shardList []int,
 ) {
 	for _, server := range kv.lastConfig.Groups[gid] {
-		args := PullShardArgs{
+		request := PullShardRequest{
 			ShardList: shardList,
 			Num:       kv.config.Num,
 		}
-		reply := PullShardReply{}
+		response := PullShardResponse{}
 
-		ok := kv.make_end(server).Call("ShardKV.PullShard", &args, &reply)
-		if ok && reply.Err == OK {
-			state := reply.State
-			client := reply.Client
-			num := reply.Num
-			command := MergeState{
+		ok := kv.makeEnd(server).Call("ShardKV.PullShard", &request, &response)
+		if ok && response.Err == OK {
+			state := response.State
+			client := response.Client
+			num := response.Num
+			command := PullShard{
 				State:  state,
 				Client: client,
 				Num:    num,
 			}
 			index, _, isLeader := kv.rf.Start(command)
 			if isLeader {
-				DPrintf(
-					"[Group %d][Instance %d] MergeState %v from %d - start\n",
-					kv.gid, kv.me, gid, shardList,
-				)
-				reply.Err = kv.Consensus(index)
+				_, response.Err = kv.consensus(index)
 			} else {
-				reply.Err = ErrWrongLeader
+				response.Err = ErrWrongLeader
 			}
+			break
 		}
 	}
 	waitGroup.Done()
@@ -464,52 +442,49 @@ func (kv *ShardKV) sendDeleteShard(
 	shardList []int,
 ) {
 	for _, server := range kv.lastConfig.Groups[gid] {
-		args := DeleteShardArgs{
+		request := DeleteShardRequest{
 			ShardList: shardList,
 			Num:       kv.config.Num,
 		}
-		reply := DeleteShardReply{}
+		response := DeleteShardResponse{}
 
-		ok := kv.make_end(server).Call("ShardKV.DeleteShard", &args, &reply)
-		if ok && reply.Err == OK {
+		ok := kv.makeEnd(server).Call("ShardKV.DeleteShard", &request, &response)
+		if ok && response.Err == OK {
 			num := kv.config.Num
-			command := DeleteState{
+			command := DeleteShard{
 				Num:       num,
 				ShardList: shardList,
 			}
 
 			index, _, isLeader := kv.rf.Start(command)
 			if isLeader {
-				DPrintf(
-					"[Group %d][Instance %d] DeleteState %v - start\n",
-					kv.gid, kv.me, shardList,
-				)
-				reply.Err = kv.Consensus(index)
+				_, response.Err = kv.consensus(index)
 			} else {
-				reply.Err = ErrWrongLeader
+				response.Err = ErrWrongLeader
 			}
+			break
 		}
 	}
 	waitGroup.Done()
 }
 
 func (kv *ShardKV) PullShard(
-	args *PullShardArgs,
-	reply *PullShardReply,
+	request *PullShardRequest,
+	response *PullShardResponse,
 ) {
 	if _, isLeader := kv.rf.GetState(); !isLeader {
-		reply.Err = ErrWrongLeader
+		response.Err = ErrWrongLeader
 		return
 	}
 
 	kv.mu.RLock()
-	if kv.config.Num < args.Num {
-		reply.Err = ErrFuture
+	if kv.config.Num < request.Num {
+		response.Err = ErrFuture
 		kv.mu.RUnlock()
 		return
 	}
 
-	shardList := args.ShardList
+	shardList := request.ShardList
 	state := make(map[int]Shard)
 	for _, shard := range shardList {
 		state[shard] = Shard{
@@ -522,98 +497,64 @@ func (kv *ShardKV) PullShard(
 		client[clientId] = messageId
 	}
 
-	reply.State = state
-	reply.Client = client
-	reply.Num = kv.config.Num
-	reply.Err = OK
+	response.State = state
+	response.Client = client
+	response.Num = kv.config.Num
+	response.Err = OK
 	kv.mu.RUnlock()
 }
 
 func (kv *ShardKV) DeleteShard(
-	args *DeleteShardArgs,
-	reply *DeleteShardReply,
+	request *DeleteShardRequest,
+	response *DeleteShardResponse,
 ) {
 	if _, isLeader := kv.rf.GetState(); !isLeader {
-		reply.Err = ErrWrongLeader
+		response.Err = ErrWrongLeader
 		return
 	}
 
 	kv.mu.RLock()
-	if kv.config.Num > args.Num {
-		reply.Err = OK
+	if kv.config.Num > request.Num {
+		response.Err = OK
 		kv.mu.RUnlock()
 		return
 	}
 	kv.mu.RUnlock()
 
-	num := args.Num
-	shardList := args.ShardList
-	command := DeleteState{
+	num := request.Num
+	shardList := request.ShardList
+	command := DeleteShard{
 		Num:       num,
 		ShardList: shardList,
 	}
 	index, _, isLeader := kv.rf.Start(command)
 	if isLeader {
-		DPrintf(
-			"[Group %d][Instance %d] DeleteState %v - start\n",
-			kv.gid, kv.me, shardList,
-		)
-		reply.Err = kv.Consensus(index)
+		_, response.Err = kv.consensus(index)
 	} else {
-		reply.Err = ErrWrongLeader
+		response.Err = ErrWrongLeader
 	}
 }
 
-func (kv *ShardKV) Consensus(
-	index int,
-) Err {
-	kv.mu.Lock()
-	kv.clientCh[index] = make(chan Command, 1)
-	clientCh := kv.clientCh[index]
-	kv.mu.Unlock()
-
-	var result Err
-	select {
-	case <-clientCh:
-		result = OK
-	case <-time.After(500 * time.Millisecond):
-		result = ErrTimeout
-	}
-
-	go func() {
-		kv.mu.Lock()
-		close(clientCh)
-		delete(kv.clientCh, index)
-		kv.mu.Unlock()
-	}()
-
-	return result
-}
-
-func (kv *ShardKV) Command(
-	args *CommandArgs,
-	reply *CommandReply,
+func (kv *ShardKV) Operation(
+	request *OperationRequest,
+	response *OperationResponse,
 ) {
-	clientId := args.ClientId
-	messageId := args.MessageId
-	key := args.Key
-	value := args.Value
-	method := args.Method
+	clientId := request.ClientId
+	messageId := request.MessageId
+	key := request.Key
+	value := request.Value
+	method := request.Method
 	shard := key2shard(key)
 
 	kv.mu.RLock()
 	if kv.staleShard(shard) {
-		// DPrintf(
-		// 	"[Group %d][Instance %d][Client %d][Message %d] %v (%v, %v) - stale shard %d\n",
-		// 	kv.gid, kv.me, clientId, messageId, method, key, value, shard,
-		// )
-		reply.Err = ErrWrongGroup
+		response.Err = ErrWrongGroup
 		kv.mu.RUnlock()
 		return
 	}
 	kv.mu.RUnlock()
 
-	command := Command{
+	command := Operation{
 		ClientId:  clientId,
 		MessageId: messageId,
 		Key:       key,
@@ -623,67 +564,68 @@ func (kv *ShardKV) Command(
 
 	index, _, isLeader := kv.rf.Start(command)
 	if !isLeader {
-		reply.Err = ErrWrongLeader
+		response.Err = ErrWrongLeader
 		return
 	}
 
+	appliedCommand, err := kv.consensus(index)
+	if err == ErrTimeout {
+		response.Err = ErrTimeout
+		return
+	}
+
+	operation, ok := appliedCommand.(Operation)
+	if !ok {
+		response.Err = ErrWrongLeader
+		return
+	}
+
+	appliedClientId := operation.ClientId
+	appliedMessageId := operation.MessageId
+	if clientId != appliedClientId || messageId != appliedMessageId {
+		response.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.RLock()
+	if kv.staleShard(shard) {
+		response.Err = ErrWrongGroup
+		kv.mu.RUnlock()
+		return
+	}
+	if method == "Get" {
+		response.Value = kv.state[shard].Get(key)
+	}
+	kv.mu.RUnlock()
+	response.Err = OK
+}
+
+func (kv *ShardKV) consensus(
+	index int,
+) (interface{}, Err) {
 	kv.mu.Lock()
-	DPrintf(
-		"[Group %d][Instance %d][Client %d][Message %d] %v (%v, %v) - start\n",
-		kv.gid, kv.me, clientId, messageId, method, key, value,
-	)
-	kv.clientCh[index] = make(chan Command, 1)
-	clientCh := kv.clientCh[index]
+	kv.broadcastCh[index] = make(chan interface{}, 1)
+	broadcastCh := kv.broadcastCh[index]
+	defer kv.closeChannel(index)
 	kv.mu.Unlock()
 
 	select {
-	case appliedCommand := <-clientCh:
-		DPrintf(
-			"[Group %d][Instance %d][Client %d][Message %d] %v (%v, %v) - applied\n",
-			kv.gid, kv.me, clientId, messageId, method, key, value,
-		)
-
-		appliedClientId := appliedCommand.ClientId
-		appliedMessageId := appliedCommand.MessageId
-		if clientId != appliedClientId || messageId != appliedMessageId {
-			DPrintf(
-				"[Group %d][Instance %d][Client %d][Message %d] %v (%v, %v) - stale\n",
-				kv.gid, kv.me, clientId, messageId, method, key, value,
-			)
-			reply.Err = ErrWrongLeader
-			return
-		}
-
-		kv.mu.RLock()
-		if kv.staleShard(shard) {
-			DPrintf(
-				"[Group %d][Instance %d][Client %d][Message %d] %v (%v, %v) - stale shard %d\n",
-				kv.gid, kv.me, clientId, messageId, method, key, value, shard,
-			)
-			reply.Err = ErrWrongGroup
-			kv.mu.RUnlock()
-			return
-		}
-
-		if method == "Get" {
-			reply.Value = kv.state[shard].Get(key)
-		}
-		kv.mu.RUnlock()
-		reply.Err = OK
+	case command := <-broadcastCh:
+		return command, OK
 	case <-time.After(500 * time.Millisecond):
-		reply.Err = ErrTimeout
-		DPrintf(
-			"[Group %d][Instance %d][Client %d][Message %d] %v (%v, %v) - timeout\n",
-			kv.gid, kv.me, clientId, messageId, method, key, value,
-		)
+		return nil, ErrTimeout
 	}
+}
 
-	go func() {
-		kv.mu.Lock()
-		close(clientCh)
-		delete(kv.clientCh, index)
-		kv.mu.Unlock()
-	}()
+func (kv *ShardKV) closeChannel(
+	index int,
+) {
+	kv.mu.Lock()
+	if broadcastCh, ok := kv.broadcastCh[index]; ok {
+		close(broadcastCh)
+		delete(kv.broadcastCh, index)
+	}
+	kv.mu.Unlock()
 }
 
 //
@@ -712,20 +654,20 @@ func (kv *ShardKV) killed() bool {
 // atomically save the Raft state along with the snapshot.
 //
 // the k/v server should snapshot when Raft's saved state exceeds
-// maxraftstate bytes, in order to allow Raft to garbage-collect its
-// log. if maxraftstate is -1, you don't need to snapshot.
+// maxRaftState bytes, in order to allow Raft to garbage-collect its
+// log. if maxRaftState is -1, you don't need to snapshot.
 //
 // gid is this group's GID, for interacting with the shardctrler.
 //
 // pass ctrlers[] to shardctrler.MakeClerk() so you can send
 // RPCs to the shardctrler.
 //
-// make_end(servername) turns a server name from a
+// makeEnd(servername) turns a server name from a
 // Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
 // send RPCs. You'll need this to send RPCs to other groups.
 //
 // look at client.go for examples of how to use ctrlers[]
-// and make_end() to send RPCs to the group owning a specific shard.
+// and makeEnd() to send RPCs to the group owning a specific shard.
 //
 // StartServer() must return quickly, so it should start goroutines
 // for any long-running work.
@@ -734,27 +676,27 @@ func StartServer(
 	servers []*labrpc.ClientEnd,
 	me int,
 	persister *raft.Persister,
-	maxraftstate int,
+	maxRaftState int,
 	gid int,
 	ctrlers []*labrpc.ClientEnd,
-	make_end func(string) *labrpc.ClientEnd,
+	makeEnd func(string) *labrpc.ClientEnd,
 ) *ShardKV {
-	labgob.Register(Command{})
+	labgob.Register(Operation{})
 	labgob.Register(Configuration{})
-	labgob.Register(MergeState{})
-	labgob.Register(DeleteState{})
+	labgob.Register(PullShard{})
+	labgob.Register(DeleteShard{})
 
 	kv := new(ShardKV)
 	kv.me = me
-	kv.maxraftstate = maxraftstate
-	kv.make_end = make_end
+	kv.maxRaftState = maxRaftState
+	kv.makeEnd = makeEnd
 	kv.gid = gid
 
 	kv.ctrlers = ctrlers
 	kv.clerk = shardctrler.MakeClerk(kv.ctrlers)
 
 	kv.client = make(map[int64]int)
-	kv.clientCh = make(map[int]chan Command)
+	kv.broadcastCh = make(map[int]chan interface{})
 	for index := range kv.state {
 		kv.state[index] = Shard{
 			Status: Default,
@@ -769,8 +711,9 @@ func StartServer(
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	go kv.applyRoutine()
-	go kv.configureRoutine()
-	go kv.migrationRoutine()
-	go kv.collectionRoutine()
+	go kv.configurationRoutine()
+	go kv.pullShardRoutine()
+	go kv.deleteShardRoutine()
+	go kv.heartbeatRoutine()
 	return kv
 }
